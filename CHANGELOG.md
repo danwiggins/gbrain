@@ -2,7 +2,7 @@
 
 All notable changes to GBrain will be documented in this file.
 
-## [0.37.1.0] - 2026-05-19
+## [0.37.3.0] - 2026-05-19
 
 **Your agent now catches skills that would call the web before checking the brain. The same class of miss that flagged Garry's own Palantir tweet as a risk because none of the three eval models knew he built it.**
 
@@ -78,7 +78,7 @@ What we caught and fixed before merging:
 - The runtime MCP-dispatch brain-first gate is the bigger follow-up wave. Static-check covers authorship; runtime covers compliance. Filed as v0.37+ TODO.
 - Co-Authored-By: garrytan-agents (PR #1206 contributor) — the EXEMPT_SKILLS list shape, regex set, and tweet-shield incident framing carry forward verbatim.
 
-## To take advantage of v0.37.1.0
+## To take advantage of v0.37.3.0
 
 `gbrain upgrade` runs `gbrain post-upgrade` which runs `gbrain apply-migrations`.
 This release has no schema migrations — every change is filesystem-only — so the
