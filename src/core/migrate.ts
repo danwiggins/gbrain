@@ -3760,11 +3760,37 @@ export const MIGRATIONS: Migration[] = [
   },
   {
     version: 81,
+    name: 'page_links_view_alias',
+    // v0.38 — pglite-engine.ts and postgres-engine.ts both query a relation
+    // named `page_links` (LEFT JOIN page_links pl ON pl.to_page_id = p.id —
+    // see pglite-engine.ts:896 / postgres-engine.ts:959). The canonical
+    // table has always been `links`. This migration installs a `page_links`
+    // VIEW that aliases the table so brains initialized before the v0.38
+    // schema bundle pick up the alias on upgrade.
+    //
+    // Fresh installs already get the view via the embedded schema bundle.
+    // This migration is idempotent (CREATE OR REPLACE VIEW) so re-running
+    // is safe on either engine.
+    //
+    // Discovered during the brainstorm-cathedral wave when the E2E test had
+    // to workaround the missing view to exercise the resume path.
+    //
+    // Narrow projection (id, from_page_id, to_page_id) so the view does not
+    // depend on columns added in later migrations (link_source,
+    // origin_page_id, resolution_type) — keeps ALTER TABLE DROP COLUMN
+    // and the bootstrap forward-reference probes unblocked on legacy brains.
+    sql: `
+      CREATE OR REPLACE VIEW page_links AS
+        SELECT id, from_page_id, to_page_id FROM links;
+    `,
+  },
+  {
+    version: 82,
     name: 'takes_kind_drop_check',
-    // v0.38 schema-packs wave (T3 + codex T10 fix). Renumbered v80→v81
-    // during master merge — master's v0.37.2.0 hotfix claimed v80
-    // (takes_unresolvable_quality) between when this branch cut and the
-    // v0.38 ship.
+    // v0.38 schema-packs wave (T3 + codex T10 fix). Renumbered v80→v81→v82
+    // during master merges — master's v0.37.2.0 hotfix claimed v80
+    // (takes_unresolvable_quality), then v0.39.0.0 shanghai-v3 merge claimed
+    // v81 (page_links_view_alias). This migration lands as v82.
     //
     // Pre-v0.38: `takes.kind` was enforced by a DB CHECK constraint
     // CHECK (kind IN ('fact','take','bet','hunch')) at the original
@@ -3790,10 +3816,11 @@ export const MIGRATIONS: Migration[] = [
     `,
   },
   {
-    version: 82,
+    version: 83,
     name: 'eval_candidates_schema_pack_per_source',
     // v0.38 schema-packs wave (T4 + T28 + E10 + E11 codex fold).
-    // Renumbered v81→v82 during master merge alongside v81 (takes_kind_drop_check).
+    // Renumbered v81→v82→v83 during master merges alongside v82
+    // (takes_kind_drop_check) — shanghai-v3 claimed v81 (page_links_view_alias).
     //
     // Adds `eval_candidates.schema_pack_per_source JSONB` so `gbrain
     // eval replay` reproduces the EXACT per-source closure that the
