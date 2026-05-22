@@ -216,7 +216,12 @@ export async function dispatchPerSource(
           idempotency_key: `autopilot-cycle:${src.id}:${opts.slot}`,
           max_attempts: 2,
           timeout_ms: opts.timeoutMs,
-          maxWaiting: 1,
+          // DELIBERATELY no maxWaiting: 1 here. maxWaiting is per
+          // (name, queue), so it would coalesce all N per-source jobs
+          // sharing name='autopilot-cycle' down to ONE waiting job —
+          // killing the fan-out. The per-source idempotency_key
+          // already provides the right dedup granularity (one job per
+          // source per slot, regardless of how many ticks try).
         },
       );
       dispatched.push(src.id);

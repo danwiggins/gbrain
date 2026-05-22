@@ -42,16 +42,21 @@ async function seedSource(
 ): Promise<void> {
   const localPath = opts.local_path === undefined ? `/tmp/${id}` : opts.local_path;
   const archived = opts.archived === true;
-  const config = JSON.stringify(opts.config ?? {});
-  await engine.executeRaw(
-    `INSERT INTO sources (id, name, local_path, config, archived, created_at)
-     VALUES ($1, $2, $3, $4::jsonb, $5, NOW())
-     ON CONFLICT (id) DO UPDATE
-       SET local_path = EXCLUDED.local_path,
-           config = EXCLUDED.config,
-           archived = EXCLUDED.archived`,
-    [id, id, localPath, config, archived],
-  );
+  // NOTE: do NOT use executeRaw + `JSON.stringify(config) + $N::jsonb` —
+  // postgres-js double-encodes the JS string parameter, producing a JSONB
+  // STRING shape instead of OBJECT. Use sql.json() inside the template tag.
+  // Same pattern as putPage. The pre-existing sources.ts:482 has the
+  // same latent bug; the call site there is rare (gbrain sources
+  // federate/unfederate) and out of scope for this PR.
+  const eng = engine as unknown as { sql: (...args: unknown[]) => Promise<{ count?: number }> };
+  await (eng.sql as any)`
+    INSERT INTO sources (id, name, local_path, config, archived, created_at)
+    VALUES (${id}, ${id}, ${localPath}, ${(eng.sql as any).json(opts.config ?? {})}, ${archived}, NOW())
+    ON CONFLICT (id) DO UPDATE
+      SET local_path = EXCLUDED.local_path,
+          config = EXCLUDED.config,
+          archived = EXCLUDED.archived
+  `;
 }
 
 describeIfDB('Postgres parity — listAllSources', () => {

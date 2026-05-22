@@ -50,6 +50,8 @@ beforeEach(async () => {
 
 async function seedSource(id: string, opts: { local_path?: string } = {}): Promise<void> {
   const localPath = opts.local_path ?? mkdtempSync(join(tmpdir(), `gbrain-fanout-${id}-`));
+  // Direct literal `'{}'::jsonb` is fine (no parameter binding). Test
+  // explicitly resets config to {} so each test starts clean.
   await engine.executeRaw(
     `INSERT INTO sources (id, name, local_path, config, archived, created_at)
      VALUES ($1, $2, $3, '{}'::jsonb, false, NOW())

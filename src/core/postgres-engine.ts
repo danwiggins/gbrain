@@ -967,16 +967,21 @@ export class PostgresEngine implements BrainEngine {
     // shape this autopilot wave uses is flat (`last_full_cycle_at`,
     // `archive_*`, etc.) so concat is sufficient. Idempotent on re-run.
     //
-    // sql.json(patch) is the canonical safe path per feedback_postgres_jsonb_double_encode
-    // — postgres-js handles JSONB serialization (no double-encode). Matches
-    // the pattern at putPage and submitJob elsewhere in this file.
+    // MUST use sql.json(patch) inside the template tag — postgres-js's
+    // positional executeRaw + `$1::jsonb` cast DOUBLE-ENCODES the
+    // JSON.stringify'd string, producing a JSONB STRING shape instead
+    // of OBJECT. `||` between JSONB object + JSONB string yields a
+    // JSONB ARRAY (concat semantics for non-matching types), which
+    // wipes every existing config key. sql.json(...) inside the
+    // template tag is the canonical safe path — same pattern as
+    // putPage + submitJob elsewhere in this file. Empirically verified
+    // produces jsonb_typeof = 'object'.
     const sql = this.sql;
     const result = await sql`
       UPDATE sources
          SET config = COALESCE(config, '{}'::jsonb) || ${sql.json(patch as Parameters<typeof sql.json>[0])}
        WHERE id = ${sourceId}
     `;
-    // postgres-js returns count as result.count; matched-rows shape
     return (result.count ?? 0) > 0;
   }
 
