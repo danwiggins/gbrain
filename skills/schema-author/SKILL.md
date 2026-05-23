@@ -92,6 +92,10 @@ Invoke when the user (or a sibling skill) says any of:
 DON'T invoke for "where does THIS note go" (use brain-taxonomist) or
 "who knows about X" (use expert-routing / `gbrain whoknows`).
 
+## Tutorial
+
+New to schema authoring? See [`docs/schema-author-tutorial.md`](../../docs/schema-author-tutorial.md) for a 5-minute walkthrough from `gbrain schema fork` to `gbrain whoknows` surfacing a custom type. The tutorial uses placeholder pages so you can run it against any brain without affecting real content.
+
 ## Workflow
 
 ### Phase 1 — Brain (know which pack is active)
