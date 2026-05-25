@@ -50,6 +50,166 @@ What you can now do:
 To take advantage of v0.41.6.0: just `gbrain upgrade` and re-run your
 flow. No manual migration needed. New `--break-lock` / `--force-break-lock`
 flags are documented in `gbrain sync --help`.
+## [0.41.5.0] - 2026-05-24
+
+**Six community bug-fix PRs land + the E2E suite stops lying about itself.** A fix-wave triage swept the 333-PR queue, closed 10 PRs as already-shipped (with credit, naming the commits + files), and bundled 6 real fixes from the community into one collector. Plus three E2E-suite reliability fixes that surfaced while getting the full Docker suite to 100% green.
+
+You can now run `gbrain init --help` from inside a directory with 1000+ markdown files without it silently overwriting your Supabase config with PGLite. Your Supabase brain stops auth-failing at the direct connection because the pooler-form `postgres.<ref>` username now gets stripped before deriving the direct URL. OpenAI embedding batches that hit the 1M-token TPM ceiling actually engage the recursive-halving safety net (the `Invalid 'input': maximum request size is 300000 tokens per request.` error message now matches the recognition regex; pre-fix it never fired). The dream-cycle's synthesize phase stops dying with `subagent job rejected: data.model "claude-sonnet-4-6" references an unknown provider` because the queue.add subagent validator now sees `anthropic:claude-sonnet-4-6` from a narrow prefix-fix at the call site.
+
+To turn it on: `gbrain upgrade`. The contributor closure comments include the exact commit SHA + file:line that already shipped each fix, so anyone who filed a duplicate or stale PR can verify the work landed.
+
+What you'd see in a concrete example. Pre-this-release: `gbrain init --help` from `~/Documents` (with 1500+ `.md` files inferred as a brain candidate) writes `engine: 'pglite'` + `database_path: ~/.gbrain/brain.pglite` to your real config, silently disconnecting you from Supabase. Post-fix: `--help` short-circuits before any state write; help text prints; config untouched. Same shape for the other five fixes: documented bugs, real repros, real fixes, real tests.
+
+Things to know about. (1) Two cross-file E2E reliability fixes in `scripts/run-e2e.sh`: per-file `pg_terminate_backend` flush kills stale connections from the prior bun process before the next file's `setupDB()` TRUNCATE races them, AND a hard 180s outer `gtimeout`/`timeout` cap so a wedged PGLite WASM call in beforeAll/afterAll can't pin the entire suite (this caught a real 30+ min wedge on `ingestion-roundtrip.test.ts` during the wave). (2) The `gbrain doctor` test in `test/e2e/mechanical.test.ts` now pins `--embedding-model openai:text-embedding-3-large` on its init step (was inheriting whatever the resolver picked from env keys, producing dim-mismatch warnings under sequential E2E) and `DELETE FROM sources WHERE id != 'default'` in beforeAll (was inheriting orphan `delta` source rows from prior files, producing `sync_freshness FAIL`).
+
+Credit to the 6 community contributors whose PRs landed: @mgunnin (x2: max_batch_tokens + isTokenLimitError regex), @brandonlipman (x2: connection-manager username strip + init --help guard), @jeremyknows (frontmatter-install-hook test isolation), @garrytan-agents (routing-eval intent-field guard). Plus 10 superseded PRs closed with credit (#798, #1083, #918, #1119, #602, #758, #539, #1287, #1117, #1125) — fix already on master via prior waves (v0.31.7 #804 + v0.36.1.1 #1182 + v0.38.2.0 #1297 + others); contributor closures cite each landing commit + file location.
+
+### Itemized changes
+
+**The 6 community fix-wave cherry-picks:**
+
+- **#924 (mgunnin):** `src/core/ai/recipes/openai.ts` gains `max_batch_tokens: 100_000` on the embedding touchpoint. Pre-fix OpenAI was the only recipe missing this cap; the recursive-halving safety net never engaged on token-dense pages (Discord exports, JSON dumps, code-heavy markdown), then retry storm and block the queue head. 100K estimated = ~150K real worst-case, safely under OpenAI's 300K per-request hard cap.
+- **#990 (mgunnin):** `src/core/ai/gateway.ts:1264` `isTokenLimitError` now matches `maximum request size.*tokens` so OpenAI's actual error string triggers recursive halving. Pre-fix the regex caught Voyage and generic shapes but not OpenAI's literal wording. Tests in `test/ai/adaptive-embed-batch.test.ts` pin the recognition.
+- **#761 (brandonlipman):** `src/core/connection-manager.ts:144-148` `deriveDirectUrl` now strips the `postgres.<ref>` pooler-form username down to bare `postgres` when synthesizing the Supabase direct URL. Pre-fix Supabase direct connections silently failed auth because they expect bare `postgres` (the `.<ref>` suffix is a pooler-routing-only thing). Tests in `test/connection-manager.serial.test.ts`.
+- **#762 (brandonlipman):** `src/commands/init.ts:13-16` adds a `--help`/`-h` short-circuit at the top of `runInit`. Pre-fix `gbrain init --help` from a directory with many `.md` files would fall through to smart-detection, scan cwd, then `saveConfig()` — silently overwriting any existing Postgres config with PGLite defaults. Confirmed in the wild on a 10K-page Supabase brain.
+- **#916 (jeremyknows):** `test/frontmatter-install-hook.test.ts` test isolation fix — uses `--local --get` instead of `--get` (which falls back to global config). Without this, developers with `core.hooksPath` set globally (dotfiles managers pointing at `~/.config/git/hooks`) see a deterministic FAIL.
+- **#1332 (garrytan-agents):** `src/core/routing-eval.ts` adds defensive guard so `loadRoutingFixtures({intent: undefined})` doesn't crash `gbrain doctor` with `undefined is not an object (evaluating s.toLowerCase)`. Fixture validation now reports malformed entries instead of crashing the whole doctor run.
+
+**Three E2E reliability fixes (surfaced during this wave):**
+
+- **`src/core/cycle/synthesize.ts:395-404`** narrow `anthropic:` prefix fix at the queue.add boundary. `resolveModel` returns the bare id from `TIER_DEFAULTS`/`DEFAULT_ALIASES` (e.g. `claude-sonnet-4-6`); the subagent validator requires `provider:model` and rejected with `unknown provider`, dropping synthesize to `status: fail` with `SYNTH_PHASE_FAIL`. Narrow conditional prefix at the call site (only when no colon AND starts with `claude-`) avoids changing the constants which would ripple across every `resolveModel` caller.
+- **`scripts/run-e2e.sh` per-file connection flush + outer timeout.** Two cross-file isolation hardenings: (1) `psql -At -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid != pg_backend_pid() AND datname = current_database()"` before each file kills idle connections from the prior bun process's pool, which were racing with the next file's `TRUNCATE CASCADE` and producing 'fixture pages disappear mid-test' failures; (2) hard 180s outer `gtimeout`/`timeout` cap so a PGLite WASM hang in beforeAll/afterAll can't wedge the entire suite. Both surfaced during the wave: 3 of 5 cross-file flakes caught by the connection flush; `ingestion-roundtrip` 30-min wedge caught by the outer timeout.
+- **`test/e2e/mechanical.test.ts` doctor test hardening.** Two fixes: pin `--embedding-model openai:text-embedding-3-large` on the init subprocess (was inheriting env-resolver defaults that produced dim-mismatch under sequential E2E); `DELETE FROM sources WHERE id != 'default'` in beforeAll (was inheriting orphan `delta` source rows from prior files, producing `sync_freshness FAIL`).
+
+### For contributors
+
+Wave triage process notes:
+- 333-PR queue evaluated via per-PR isolation runs + cross-reference against master HEAD (the load-bearing trick: read each PR's diff against its OWN base, not against current master, to see the actual intended change without v0.38-0.40 reverts contaminating the view).
+- 10 PRs closed-as-superseded with credit comments citing the landing commit SHA + file:line so contributors can verify the fix shipped. The contributor close template is captured in `~/.claude/plans/time-for-fix-wave-warm-narwhal.md`.
+- 2 mid-wave additional supersession discoveries (PR #1117 + PR #1125) caught via the `git log -S "configuredProviderIds" origin/master` pattern after master had already absorbed them via v0.36.1.1 #1182 (28-fix collector from 5 weeks ago); both closed with credit pointing at the absorbed commit.
+- Tests on the wave reached 117/117 files / 821/821 tests pass against fresh Docker pgvector container after fixing the cross-file flake class.
+
+## [0.41.4.0] - 2026-05-24
+
+**Run your embedder, your reranker, and your dream judge on your own hardware. Windows users can pipe into `gbrain` like everyone else.** Three community PRs land together in one wave that takes gbrain's "local AI" story from "kinda" to "first-class." If you point gbrain at a llama.cpp embedding server, an Ollama box, or a self-hosted llama.cpp running Qwen3-Reranker, the doctor / autopilot / budget / models surfaces all treat them as real providers. The dream-cycle significance judge stops being hardcoded to Anthropic — point it at DeepSeek or any other registered chat provider via one config line. And `gbrain put my-slug` finally reads stdin correctly on Windows.
+
+Everything in this wave came from the community. Closed PRs #1325, #1326, #1329, #1349, #1365, #1366 cherry-picked or reworked here.
+
+### How to turn it on
+
+Nothing to flip. The local-provider path activates the moment you set a local provider as your embedding/reranker model:
+
+```bash
+# Local embedding via llama.cpp:
+gbrain config set embedding_model llama-server:nomic-embed-text
+
+# Local reranker via llama.cpp in --reranking mode (separate port from embeddings):
+llama-server --model qwen3-reranker-4b-q4_k_m.gguf --alias qwen3-reranker-4b --reranking --port 8081
+gbrain config set provider_base_urls.llama-server-reranker http://localhost:8081/v1
+gbrain config set search.reranker.model llama-server-reranker:qwen3-reranker-4b
+gbrain config set search.reranker.enabled true
+
+# Dream judge via DeepSeek (was Anthropic-only):
+gbrain config set models.dream.synthesize_verdict deepseek:deepseek-chat
+# DEEPSEEK_API_KEY env var is picked up automatically by the deepseek recipe
+```
+
+`gbrain models doctor` now probes embedding reachability the same way it probes reranker. Fresh installs see the local-providers-are-priced-at-$0 contract automatically.
+
+### What you'd see in a concrete example
+
+| Scenario | Before | After |
+|---|---|---|
+| `gbrain doctor --remediation-plan` on an Ollama embedding brain | "blocked: missing embedding API key" (incorrect) | no false block — local provider recognized |
+| `gbrain reindex --max-cost 0.01` on a local embed/rerank | `BudgetExhausted(no_pricing)` hard-fail | runs (priced at $0 — electricity, not tokens) |
+| `gbrain models doctor` with local llama-server-embeddings | only config probe ran; dead server invisible until first embed | reachability probe fires; dead server flagged immediately |
+| `gbrain models doctor` with local llama-server-reranker | probe used recipe's 30s default | now matches `search.reranker.timeout_ms` if you set it (probe lies were possible either direction) |
+| `gbrain dream --phase synthesize` on a DeepSeek-configured brain | "no ANTHROPIC_API_KEY for significance judge" — phase no-op | routes through gateway → DeepSeek → emits verdicts |
+| `echo content \| gbrain put slug` on Windows | `ENOENT: /dev/stdin` | reads stdin via fd 0 (canonical cross-platform pattern) |
+| Reading the PR queue with a long recipe name (`llama-server-reranker`, 21 chars) | "PROVIDER" column overflowed → row started with no space delimiter; downstream parser broke | dynamic-width column accommodates any recipe id |
+
+### What's safe to know about
+
+- **Voyage/Google brains relying on `gbrain config set voyage_api_key` (no env var):** `gbrain doctor --remediation-plan` is now strict about which provider's key it checks. If you set the key via `gbrain config set` (not env), the remediation planner sees it as not-yet-configured because those config keys aren't threaded to the gateway yet. Workaround: set the env var (`VOYAGE_API_KEY=...`, `GOOGLE_GENERATIVE_AI_API_KEY=...`). This is honest about a real gap — the previous behavior silently passed because of a wide-net fallback that accepted any OpenAI/ZE key.
+- **Dream synthesize verdict model change:** if you had `dream.synthesize.verdict_model` set (deprecated key), it'll keep working via the legacy fallback. The canonical key is now `models.dream.synthesize_verdict`.
+- **The new CI guard `scripts/check-gateway-routed-no-direct-anthropic.sh`** prevents `synthesize.ts` and `think/index.ts` from regressing back to `new Anthropic()`. Type-only imports stay allowed (the adapter needs `Anthropic.Message` as a type).
+
+### Itemized changes
+
+**Local providers as first-class (was: hosted-only assumed everywhere):**
+
+- New `embeddingProviderConfigured(embeddingModel, resolveKey)` helper in `src/core/brain-score-recommendations.ts` reads the recipe registry: empty `auth_env.required` (ollama, llama-server) returns true with no key; hosted providers check their OWN required key. Replaces the prefix ladder in `doctor.ts` AND the parallel copy in `autopilot.ts`. Exported `HOSTED_EMBED_KEY_CONFIG` map (env-var → config field) lets both producers build the same closure once.
+- `RecommendationContext.hasEmbeddingApiKey` renamed to `embeddingProviderConfigured` (the field never meant "API key"). Blocker reason broadened from "missing embedding API key" to "embedding provider not configured" — covers both missing hosted key AND missing local recipe.
+- `FREE_LOCAL_EMBED_PROVIDERS = {ollama, llama-server}` joins existing `FREE_LOCAL_RERANK_PROVIDERS` in `src/core/budget/budget-tracker.ts`. `--max-cost`-bounded embed/reindex jobs no longer hard-fail TX2 on local providers. `lmstudio` deliberately excluded (no recipe); `litellm` excluded (proxy can front paid).
+- New `probeEmbeddingReachability()` in `src/commands/models.ts` mirrors `probeRerankerReachability` — a 1-input embed with 5s abort timeout, new `embedding_reachability` touchpoint, gated on the zero-network config probe returning `ok` first.
+
+**Local reranker via llama.cpp (was: ZeroEntropy-hosted only):**
+
+- New recipe `llama-server-reranker` at `src/core/ai/recipes/llama-server-reranker.ts`. Distinct from `llama-server` (embedding) because llama.cpp's `--reranking` and `--embeddings` flags are mutually exclusive at launch — one process per mode, two recipes, two base URLs. Default port 8081 vs 8080.
+- `RerankerTouchpoint.path?: string` + `default_timeout_ms?: number` in `src/core/ai/types.ts`. Absent on ZE's recipe → behavior there unchanged. New recipe declares `path: '/rerank'` (concat with `/v1` base URL → `…/v1/rerank`) and `default_timeout_ms: 30000` (CPU-cold-start headroom).
+- `src/core/search/mode.ts` reranker-timeout precedence: per-call > config > recipe `default_timeout_ms` > mode bundle. Closes the dead-default-timeout class.
+- `src/cli.ts` env passthrough: `LLAMA_SERVER_RERANKER_BASE_URL` → `provider_base_urls.llama-server-reranker`. Sibling of `LLAMA_SERVER_BASE_URL`.
+- `resolveLiveRerankerModel(engine)` + `resolveLiveRerankerTimeoutMs(engine)` in `src/commands/models.ts` so probe and live search read the SAME config (closes file-plane / DB-plane divergence). Probe's `getRerankerModel()` was reading `GBrainConfig.reranker_model` — a file-plane field nothing writes; live search read the DB plane via `loadSearchModeConfig`.
+
+**Dream cycle significance judge — gateway-routed (was: hardcoded `new Anthropic()`):**
+
+- `src/core/cycle/synthesize.ts` `makeJudgeClient(verdictModel)` replaces `makeHaikuClient()`. Mirrors `tryBuildGatewayClient` in `src/core/think/index.ts:579-637` (the v0.35.5.0 #952 pattern). Construction-time probe returns `null` on missing key OR unknown provider; the verdict loop wraps the gateway.chat call in try/catch for AIConfigError so mid-run provider failures surface as per-transcript `worth=false, reasons=['gateway error: ...']` instead of crashing the phase.
+- Strict gateway migration — NO env-var sniffing. Canonical config key `models.dream.synthesize_verdict` (per `PER_TASK_KEYS` in `src/core/model-config.ts`). Deprecated `dream.synthesize.verdict_model` still resolves via the v0.28 model-resolution chain for legacy configs.
+- `JudgeClient` interface signature preserved verbatim for test-seam stability.
+
+**Cross-platform stdin:**
+
+- `src/cli.ts:511` swaps `readFileSync('/dev/stdin', 'utf-8')` → `readFileSync(0, 'utf-8')`. Canonical Node cross-platform stdin idiom — works on Unix and Windows alike. PR #1366's 16-line try/catch fallback was a wronger fix to the same problem; the one-line change is what shipped.
+
+**Doc improvement (the value PR #1365 was reaching for):**
+
+- `src/core/operations.ts` `put_page` description extended with: "For large content on Windows (pipe-buffer limit ~45KB) or any file-as-input workflow, use `gbrain capture --file PATH --slug SLUG` — capture reads the file as a Buffer with a binary-NUL guard and adds provenance write-through (v0.39.3.0)." Surfaces via `gbrain put --help`.
+
+**CI guard (locks the bug class shut):**
+
+- New `scripts/check-gateway-routed-no-direct-anthropic.sh` greps `src/core/cycle/synthesize.ts` and `src/core/think/index.ts` for direct `new Anthropic()` constructor calls AND for value-shaped imports of `@anthropic-ai/sdk`. Type-only imports stay allowed. Clause-level parsing handles every TypeScript import shape (default, named, namespace, mixed-type-value, dynamic). Wired into `bun run verify` and `bun run check:all`.
+
+**Tests + regressions:**
+
+- `test/cycle/synthesize-gateway-adapter.test.ts` (NEW, 11 cases): A1-A9 unit + R3 parsed-verdict semantic parity + R3 corollary (unparseable-output fallback).
+- `test/cycle/regression-pr-wave-r1-r2-r4.test.ts` (NEW): R1 (`get_page` accepts calls without `content`), R2 (`put_page` `content` stays `required: true`), R4 (cross-platform stdin behavior + source-grep). The closed PR #1365 would have broken R1 and R2; pinned forever.
+- `test/e2e/dream-synthesize-pglite.test.ts` extended: new "gateway-adapter mid-run AIConfigError catch" case + reason-text update + `withoutAnthropicKey` hardened to override `GBRAIN_HOME` (closes a hermeticity hole the gateway rework opened).
+- `src/commands/providers.ts` `formatRecipeTable` column width is now dynamic (`max(14, longest_id + 1)`) so `llama-server-reranker` (21 chars) doesn't overflow the historical 14-char column. The existing "each recipe appears at most once" test now passes naturally.
+
+**Process:**
+
+- 107 + 64 + 11 + 7 + 5 new test cases land across the wave. Final wave-affected count: 263 cases across 15 files, all green.
+- `llms.txt` + `llms-full.txt` regenerated at end of wave via `bun run build:llms` (matched against the CHANGELOG voice rules).
+- CLAUDE.md annotated with the gateway-adapter rework + CI guard so future contributors find the contract via the canonical doc.
+
+**Contributors:** PR #1325 by @tobbecokta, #1326 + #1329 by @kohai-ut, #1349 by @justemu, #1365 + #1366 by @ecat2010. Co-authored credits preserved in commit history.
+
+## To take advantage of v0.41.4.0
+
+`gbrain upgrade` should do this automatically. No schema migration ships in this release.
+
+1. **If you run local embeddings (ollama, llama-server):**
+   ```bash
+   gbrain doctor --remediation-plan --json | jq '[.. | objects | select(.reason? == "embedding provider not configured")]'
+   ```
+   Expect `[]` for a configured local-embeddings brain. If you see a block, your model string doesn't match a registered recipe — `gbrain models` lists the active resolution.
+
+2. **If you run the dream cycle on a non-Anthropic provider:**
+   ```bash
+   gbrain config set models.dream.synthesize_verdict deepseek:deepseek-chat
+   gbrain dream --phase synthesize --dry-run --json | jq '.details.verdicts'
+   ```
+   Pre-rework all verdicts would show `worth: false, reasons: ['no ANTHROPIC_API_KEY ...']`. Post-rework you'll see real Haiku-shape verdicts from your configured provider.
+
+3. **If you're on Windows:**
+   ```bash
+   echo "test content" | gbrain put windows-test-slug
+   ```
+   Should write the page; pre-fix this would throw `ENOENT: /dev/stdin`.
+
+4. **If any step fails or the numbers look wrong,** please file an issue:
+   https://github.com/garrytan/gbrain/issues with the output of `gbrain doctor` and which step broke. This feedback loop is how the gbrain maintainers find fragile upgrade paths.
+
 ## [0.41.3.0] - 2026-05-24
 
 **Pre-register Claude and ChatGPT clients without `--enable-dcr` — the SECURITY.md-recommended setup actually works now.**

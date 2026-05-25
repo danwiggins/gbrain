@@ -38,6 +38,42 @@
   CC ~3h. Tradeoff: large surface fan-out for marginal benefit on the
   CLI exit-on-timeout path. Only ship when a non-CLI consumer
   (HTTP MCP, future autopilot health checks) wants true cancellation.
+## community-pr-wave follow-ups (filed during ship)
+
+- [ ] **`FREE_LOCAL_*_PROVIDERS` zero-pricing bypassable via redirected
+  BASE_URL env vars.** An operator who sets `LLAMA_SERVER_BASE_URL=https://paid-api.com/v1`
+  routes `llama-server:foo` requests to a paid proxy, but the budget
+  tracker still zero-prices them because the provider-prefix match in
+  `FREE_LOCAL_EMBED_PROVIDERS` / `FREE_LOCAL_RERANK_PROVIDERS` doesn't
+  see the resolved URL. The bypass is real but requires operator
+  misconfiguration (paid-API behind a "local" recipe alias) — same
+  trust posture as the rest of the BASE_URL env vars.
+
+  Fix shape (couples with the unification TODO already filed for v0.41+):
+  move the freeness decision from provider-prefix lookup to the gateway's
+  embed/rerank call sites where the resolved URL is known, or detect
+  non-loopback `provider_base_urls` and refuse zero-pricing in that case.
+
+  Surfaced by codex Pass-9 adversarial review; pre-existing for the rerank
+  case in v0.40.7.1, broadened to embed by v0.40.8.0. Tracked here so the
+  unification PR closes both at once.
+
+- [ ] **`probeEmbeddingReachability` should honor recipe `default_timeout_ms`
+  for embed touchpoint.** The reranker probe was just fixed in PR #1326 to
+  read `recipe.touchpoints.reranker.default_timeout_ms` so Qwen3-Reranker-4B
+  has CPU cold-start headroom. The embedding probe hardcodes 5000ms
+  (`src/commands/models.ts:467`) and the JSDoc admits "the 5s timeout may
+  trip on the very first probe — re-run if so." A local llama-server embed
+  endpoint hits the identical CPU cold-start curve.
+
+  Fix: add optional `default_timeout_ms?: number` to `EmbeddingTouchpoint`
+  in `src/core/ai/types.ts` (sibling to the rerank field), thread through
+  `probeEmbeddingReachability` using the same `recipe.touchpoints.embedding.default_timeout_ms ?? 5000`
+  pattern that the reranker probe uses. Add a regression test in
+  `test/models-doctor-embed.test.ts` pinning the precedence chain.
+
+  Surfaced by the community-PR-wave pre-landing review (informational, no
+  blocker on the wave itself — workaround is "re-run the probe").
 ## v0.41.3 security/MCP fix wave follow-ups (filed during ship of `garrytan/security-mcp-fix-wave`)
 
 Source: codex outside-voice review on the v0.41.3 wave (D7) identified
@@ -552,6 +588,60 @@ at plan time and got carved out:
   alongside the staleness number so doctor surfaces the coverage gap inline.
   Implementation: reuse `buildSyncStatusReport` from `src/commands/sync.ts`,
 
+## v0.40.6.1 llama-server-reranker follow-ups (v0.40.7+)
+
+Filed from the /ship Claude adversarial subagent review against this PR. None are
+exploitable today; they harden the new local-reranker surface against future
+contributor traps.
+
+- [ ] **P1: SSRF scheme validation sweep for all 6 openai-compat `_BASE_URL` env vars.**
+  `src/cli.ts:1483-1487` accepts `LLAMA_SERVER_BASE_URL`, `LLAMA_SERVER_RERANKER_BASE_URL`,
+  `OLLAMA_BASE_URL`, `LMSTUDIO_BASE_URL`, `LITELLM_BASE_URL`, `OPENROUTER_BASE_URL` with
+  zero scheme validation. A `file://` or `gopher://` value silently becomes the
+  recipe's base URL. Pre-existing pattern; this wave adds one more env var to the gap
+  without expanding the class. Fix: add a `validateOpenAICompatBaseURL(url)` helper
+  (assert `http(s):` scheme + reuse `src/core/ssrf-validate.ts` private-IP checks
+  for the non-localhost case), apply to all 6 envs at the `buildGatewayConfig` site.
+  ~20 LOC + 6 test cases. Should be its own focused PR.
+
+- [ ] **P2: Document `FREE_LOCAL_RERANK_PROVIDERS` invariant.** `src/core/budget/budget-tracker.ts:lookupPricing`
+  returns `{input:0, output:0}` for any model id under the `llama-server-reranker:`
+  provider on the rerank kind. The contract relies on all callers going through
+  `gateway.rerank()`'s `assertTouchpoint`-with-extended-models check (which validates
+  the model exists before pricing fires). Theoretical bypass: a future caller that
+  reserves directly against BudgetTracker with `kind: 'rerank'` and an arbitrary
+  `llama-server-reranker:<anything>` model id gets free pricing. Fix: code comment
+  documenting the invariant, OR move the freeness check to gateway.rerank() where
+  the validation already runs.
+
+- [ ] **P2: Recipe path-concat sanity check at gateway-init.** `src/core/ai/gateway.ts:rerank()`
+  concatenates `${compat.baseURL.replace(/\/$/, '')}${tp.path ?? '/models/rerank'}`.
+  A future recipe with `path: 'rerank'` (no leading slash) produces `…/v1rerank`;
+  a future recipe with `path: '/v1/rerank'` when `base_url_default` already ends
+  in `/v1` reintroduces the codex-caught doubling bug. Fix: at `configureGateway`
+  time, assert `tp.path` (when set) starts with `/` and warn-log when the recipe
+  pattern looks doubling-prone. Surface at init, not first-rerank.
+
+- [ ] **P3: Debug-log on malformed `search.reranker.model`.** `src/core/search/mode.ts:lookupRerankerRecipeDefaultTimeout`
+  silently returns undefined when `getRecipe(providerId)` misses (typos, malformed
+  strings). Fail-open is correct for timeouts (5000ms is a safe bundle default),
+  but the user-facing UX is "config was set, nothing changed" with no signal.
+  Fix: stderr-log once when `modelStr` is non-empty but the provider id doesn't
+  resolve, gated by `GBRAIN_DEBUG=1`.
+
+- [ ] **P3: Narrow `resolveLiveRerankerModel` catch.** `src/commands/models.ts:resolveLiveRerankerModel`
+  has a blanket `try/catch` around `loadSearchModeConfig` + `resolveSearchMode`
+  that falls back to `getRerankerModel()`. Real errors (schema-version mismatch,
+  malformed config JSON, engine connectivity blip) get hidden behind a misleading
+  "not configured" doctor verdict. Fix: narrow the catch to specific shapes OR
+  emit `GBRAIN_DEBUG=1` stderr warning before falling back.
+
+- [ ] **P3: Validate `modelStr` shape before allocating probe timeout.**
+  `src/commands/models.ts:probeRerankerReachability` resolves the recipe + sets
+  `probeTimeoutMs = 30000` before checking that `modelStr` has a non-empty model
+  half. Result: `llama-server-reranker:` (trailing colon, empty model) waits 30s
+  before failing at `assertTouchpoint`. Fix: regex-validate `modelStr` shape
+  (`^[a-z][a-z0-9-]*:[a-zA-Z0-9_.-]+$`) before timeout allocation.
 
 ## v0.40.1.0 Track D follow-ups (v0.41+)
 
