@@ -191,7 +191,16 @@ export function createAuditWriter<T extends { ts: string }>(
     // for consumers (parsers don't preserve it), this is fine.
     const row = { ...event, ts };
     const dir = resolveAuditDir();
-    const file = path.join(dir, computeFilename());
+    // Route to the file matching the event's ts (not real-time-now) so
+    // a caller logging a backdated event (test fixtures, retroactive
+    // event capture, ISO-week boundary straddle) lands in the correct
+    // week file. When ts is invalid or unparseable, fall back to
+    // real-now — never throw. Production callers that don't pass ts
+    // get the same real-now behavior as before (the writer stamps ts
+    // above using new Date().toISOString()).
+    const tsForFile = Date.parse(ts);
+    const fileDate = Number.isFinite(tsForFile) ? new Date(tsForFile) : undefined;
+    const file = path.join(dir, computeFilename(fileDate));
     try {
       fs.mkdirSync(dir, { recursive: true });
       fs.appendFileSync(file, JSON.stringify(row) + '\n', { encoding: 'utf8' });

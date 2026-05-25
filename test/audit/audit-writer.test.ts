@@ -129,7 +129,12 @@ describe('createAuditWriter — log()', () => {
     await withEnv({ GBRAIN_AUDIT_DIR: dir }, async () => {
       const writer = createAuditWriter<TestEvent>({ featureName: 'ts-override' });
       writer.log({ ts: fixedTs, message: 'pinned' });
-      const file = path.join(dir, writer.computeFilename());
+      // The writer routes a backdated event into the file matching its
+      // OWN ts (not real-time-now), so the per-row ISO-week file stays
+      // correct under fixture-driven tests and retroactive event capture.
+      // Pre-fix this test only passed when the real date happened to fall
+      // in the same ISO week as the pinned ts.
+      const file = path.join(dir, writer.computeFilename(new Date(fixedTs)));
       const content = fs.readFileSync(file, 'utf8');
       const row = JSON.parse(content.trim());
       expect(row.ts).toBe(fixedTs);
