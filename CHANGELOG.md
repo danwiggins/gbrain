@@ -2,13 +2,13 @@
 
 All notable changes to GBrain will be documented in this file.
 
-## [0.42.0.0] - 2026-05-26
+## [0.41.23.0] - 2026-05-26
 
 **You can now see how every extractor in your brain is doing — how
 often it halts, what it spent, whether its eval gate fired — and your
 pack manifests can declare new extractable kinds in one verb.**
 
-Pre-v0.42, when an extractor halted partway through a long page or a
+Pre-v0.41.23, when an extractor halted partway through a long page or a
 cycle phase silently stopped writing facts, you found out by querying
 the brain a week later and noticing things were missing. The
 information was theoretically in JSONL audit files, but the operator
@@ -42,8 +42,8 @@ gbrain schema scaffold-extractable claim --pack my-pack
 # unless --force.
 
 gbrain extract benchmark --pack my-pack --kind claim
-# v0.42 ships as a stub-reporter (validates fixture corpus shape).
-# LLM dispatch deferred to v0.43+.
+# v0.41.23 ships as a stub-reporter (validates fixture corpus shape).
+# LLM dispatch deferred to a follow-up release.
 ```
 
 What you'd see in a concrete example. Say your `extract_atoms` phase is
@@ -55,7 +55,7 @@ silently halting on long conversation pages:
 | concepts              | $0.10    | 1     | 10.0%     | 1 / 0          |
 | facts.conversation    | $1.50    | 0     | 0.0%      | 5 / 0          |
 
-Before v0.42 you had to know to grep the JSONL audit files. Now `gbrain
+Before v0.41.23 you had to know to grep the JSONL audit files. Now `gbrain
 extract status` puts the halt rate above the fold, ordered most-troubled
 first.
 
@@ -68,11 +68,11 @@ Things to watch:
 - The rollup write is best-effort: a transient DB error during cycle
   doesn't crash the cycle, it bumps a `rollup_write_failures` counter
   that `gbrain doctor` surfaces on the next check.
-- `verifier_path` on `ExtractableSpec` is RESERVED in v0.42 — it parses
+- `verifier_path` on `ExtractableSpec` is RESERVED in v0.41.23 — it parses
   in pack manifests but refuses at runtime. Pack-shipped verifier code
-  arrives in v0.43+ under the trust-review gate.
+  arrives in a follow-up release under the trust-review gate.
 
-What's NOT in this release (deferred to v0.43+):
+What's NOT in this release (deferred to a follow-up):
 
 - Replay versioning + `gbrain extract replay --since v<sha>`. Waiting
   for real prompt-churn signal from pack-author usage before paying the
@@ -82,7 +82,7 @@ What's NOT in this release (deferred to v0.43+):
   is pure deterministic regex; cost-cap value-add lives at the embed
   step"); this release respects that decision.
 
-### To take advantage of v0.42.0.0
+### To take advantage of v0.41.23.0
 
 `gbrain upgrade` should do this automatically. If it didn't, or if
 `gbrain doctor` warns about a partial migration:
@@ -161,7 +161,7 @@ What's NOT in this release (deferred to v0.43+):
   benchmark --pack <name> --kind <type>`. Loads the pack's fixture
   corpus through strict D-EXTRACT-21 path validation (rejects absolute
   paths, `..` traversal, null bytes, AND symlinks that resolve outside
-  pack root). v0.42 ships as a stub reporter; LLM dispatch deferred.
+  pack root). v0.41.23 ships as a stub reporter; LLM dispatch deferred.
 
 **Wave D — operator surfaces:**
 - `src/commands/extract-status.ts` (NEW) — `gbrain extract status
@@ -202,6 +202,7 @@ What's NOT in this release (deferred to v0.43+):
 - `test/propose-takes.test.ts` — assertion tightened from `INSERT` to
   `INSERT INTO take_proposals` so the new rollup INSERT doesn't
   trigger a false positive in the existing test.
+
 ## [0.41.19.0] - 2026-05-26
 
 **Your dream cycle stops silently losing wiki links.**
