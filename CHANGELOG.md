@@ -145,6 +145,161 @@ your reformatted Circleback meetings through the fact extractor:
    page, or wait for v0.42+'s user-declared `simple_pattern`
    support.
 
+## [0.41.20.0] - 2026-05-26
+
+**One command tells you if your brain is healthy. And `gbrain doctor`
+no longer says your brain is broken when it's actually your skills
+folder that needs attention.**
+
+Two friction items, both about restoring signal-to-noise. Until this
+release: there was no single command to answer "is my brain working?"
+You ran `gbrain sources status`, `gbrain stats`, `gbrain jobs
+supervisor status`, `gbrain jobs list`, and tailed audit logs.
+Separately, `gbrain doctor` would tell you your brain health was 15/100
+when the actual brain was fine — the score was being dragged down by
+504 RESOLVER.md warnings from an OpenClaw skills tree.
+
+After this release: `gbrain status` shows sync, last cycle, locks,
+workers, queue, and autopilot state on one screen. `gbrain doctor`
+leads with a brain-only figure and renders skill/ops/meta scores
+alongside, so a polluted overall score doesn't lie to you about your
+actual data.
+
+What you can do that you couldn't before:
+
+- `gbrain status` — single-screen dashboard. Per-source sync
+  freshness, last full cycle vs last targeted run, active locks,
+  worker health, live queue depth (including OLD stuck jobs — the
+  whole point of surfacing them), autopilot daemon liveness.
+- `gbrain status --json` — stable monitoring envelope
+  (`schema_version: 1`). Exit codes 0=ok, 1=snapshot-failed, 2=usage.
+- `gbrain status --section sync` — drill into one section.
+- `gbrain status` against a thin-client install — Sync + Cycle route
+  through a new admin-scope `get_status_snapshot` MCP op; local-only
+  sections render `local-only — N/A on remote brain` instead of
+  pretending the local install's empty state is the remote brain's.
+- `gbrain doctor --scope=brain` — sub-second on a brain with thousands
+  of skills. Skips computation of the SKILL check group (resolver
+  walk, skill conformance scan, brain-first audit, whoknows health)
+  entirely. Real skip, not just an output filter.
+- `gbrain doctor` JSON envelope adds `brain_checks_score` and
+  `category_scores` (brain/skill/ops/meta), each computed with the
+  same penalty math (100 − 20×fails − 5×warns) restricted to the
+  named category. The legacy `health_score` field is unchanged and
+  remains byte-identical for any fixed check set (back-compat for
+  every existing MCP consumer + CI gate).
+- Doctor human output leads with the brain figure, then shows
+  skill/ops/meta subscores and the existing weighted
+  `BrainHealth.brain_score` alongside, so operators see both lenses
+  without confusion.
+
+The two scores are intentionally orthogonal:
+- `BrainHealth.brain_score` — weighted data-composition health
+  (35/25/15/15/10). "How healthy is my brain's data?"
+- `brain_checks_score` — penalty over brain-category check failures.
+  "How many of the brain-category doctor checks failed?"
+
+## To take advantage of v0.41.20.0
+
+`gbrain upgrade` should do this automatically. Try:
+
+```bash
+gbrain status                          # see the dashboard
+gbrain doctor --scope=brain            # brain-only doctor, sub-second
+gbrain doctor --json | jq .category_scores
+gbrain doctor --json | jq .brain_checks_score
+```
+
+If any step fails or the numbers look wrong, please file an issue at
+https://github.com/garrytan/gbrain/issues with the output of
+`gbrain doctor` + the contents of `~/.gbrain/upgrade-errors.jsonl` if
+it exists.
+
+### Itemized changes
+
+- **`gbrain status` (NEW command).** `src/commands/status.ts`
+  orchestrates 6 section renderers (sync, cycle, locks, workers,
+  queue, autopilot). Composes existing primitives —
+  `buildSyncStatusReport` from sync.ts, `readSupervisorEvents` +
+  `summarizeCrashes` from `supervisor-audit.ts`, direct queries
+  against `gbrain_cycle_locks` and `minion_jobs`, `kill -0` probe of
+  `~/.gbrain/autopilot.lock`. No new schema, no new persistence.
+  Cycle section shows TWO rows ("Last full cycle" = latest
+  `autopilot-cycle` row, "Last targeted run" = latest `autopilot-*`
+  row of any kind) to reflect v0.36.4.0's health-aware autopilot
+  where targeted handlers fire most ticks and a full cycle every
+  ~60min. Cycle totals are read from `result.report.totals` (the
+  canonical handler output shape). Queue counts are LIVE (no
+  time-window filter) so old stuck `waiting` / `active` jobs surface
+  — that's the failure mode this dashboard exists to expose.
+- **`get_status_snapshot` MCP op (NEW).** `src/core/operations.ts`.
+  Admin scope (NOT localOnly). Payload:
+  `{schema_version: 1, sync, cycle}` only. Locks / Workers / Queue /
+  Autopilot deliberately omitted from the remote payload — they're
+  local-host concerns; the local CLI renders them as "N/A on remote
+  brain" in thin-client mode instead of pretending the local
+  install's state is the remote brain's. Admin-scoped from day one
+  to prevent future feature creep (adding locks/workers counters)
+  from quietly widening the data exposed under a read-scoped token.
+- **`src/core/doctor-categories.ts` (NEW).** Single source of truth
+  for check categorization. Four exported sets
+  (BRAIN/SKILL/OPS/META) cover every check name in
+  `src/commands/doctor.ts` today. The `categorizeCheck(name)` helper
+  maps unknown names to `'meta'` with a once-per-process stderr warn
+  so drift surfaces in dev runs before CI catches it.
+- **Doctor extensions.** `src/commands/doctor.ts` extends `Check`
+  with an optional `category?` field and `DoctorReport` with
+  `brain_checks_score` + `category_scores` (additive —
+  `schema_version` stays at 2). `computeDoctorReport` tags each check
+  via `categorizeCheck()` at compute time. `buildChecks` accepts a
+  `--scope=brain` arg that gates the SKILL check group behind
+  explicit early-skip branches at each call site (resolver walk,
+  skill conformance, skill brain-first audit, whoknows health).
+  Human output leads with the brain figure and renders the weighted
+  `BrainHealth.brain_score` alongside.
+- **`gbrain doctor --remediate` UNCHANGED.**
+  `src/core/brain-score-recommendations.ts` is not touched. Codex's
+  outside-voice review caught that `--remediate` already correctly
+  reads `engine.getHealth().brain_score` (the weighted 35/25/15/15/10
+  composite), NOT the doctor's polluted `health_score`. Switching it
+  to a new field would have replaced a weighted brain metric with a
+  coarser category counter — a regression the review caught before
+  any code was written.
+- **CLI dispatch.** `src/cli.ts` registers `status` in `CLI_ONLY` and
+  adds two dispatch sites: a pre-engine-bind branch for thin-client
+  mode (Sync + Cycle via MCP op, no PGLite needed) and a normal
+  engine-connected dispatch case for local mode. Architecture:
+  status is CLI-only with its own thin-client branch inside
+  `runStatus` (not routed through op dispatch), the only
+  architecture that honestly composes local-only sections.
+- **Tests (7 new files).**
+  - `test/doctor-categories.test.ts` — drift guard: every check name
+    in doctor.ts source is categorized exactly once; CI fires loudly
+    on missed additions. Catches both `name: 'foo'` inline form and
+    `const name = 'foo'` helper-function form.
+  - `test/doctor-brain-checks-score.test.ts` — back-compat
+    byte-identity on `health_score` for a fixed check set; new field
+    math; renaming regression that asserts NO `brain_health_score`
+    field ships (it's `brain_checks_score` to avoid colliding with
+    the weighted `BrainHealth.brain_score`).
+  - `test/doctor-scope-filter.test.ts` — `--scope=brain` skips
+    computation of SKILL group entirely; observable absence of
+    `resolver_health` / `skill_conformance` / `skill_brain_first` /
+    `whoknows_health` from the returned checks list.
+  - `test/status-sections.test.ts` — `parseSectionFlag` validation +
+    exit code policy + runStatus shape.
+  - `test/get-status-snapshot-op.test.ts` — op definition pins
+    (scope is admin, localOnly false, payload omits
+    Locks/Workers/Queue/Autopilot).
+  - `test/e2e/status-pglite.test.ts` — full PGLite E2E with seeded
+    minion_jobs rows, gbrain_cycle_locks rows, and supervisor audit.
+    Asserts dual cycle rows, totals from `result.report.totals`,
+    live queue counts (no time window).
+  - `test/doctor-home-dir-in-worktree.test.ts` (UPDATED) — fixed the
+    pre-existing fragile JSON parser to anchor on the canonical
+    `{"schema_version"` envelope prefix instead of walking back from
+    `"checks"` (which broke once `category_scores` introduced a
+    nested object between).
 ## [0.41.19.0] - 2026-05-26
 
 **Your dream cycle stops silently losing wiki links.**
