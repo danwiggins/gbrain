@@ -91,7 +91,11 @@ for ((i=1; i<=NUM_PARALLEL; i+=1)); do
   OUT_F=$(mktemp -t sync-lock-out-XXXXXX)
   EXIT_FILES+=("$EXIT_F")
   OUT_FILES+=("$OUT_F")
-  ( bun run src/cli.ts sync --dir "$BRAIN_DIR" >"$OUT_F" 2>&1; echo $? > "$EXIT_F" ) &
+  # --no-embed: this test measures the writer-lock race, not embeddings.
+  # CI runners don't pipe ZEROENTROPY_API_KEY / OPENAI_API_KEY / VOYAGE_API_KEY,
+  # so without --no-embed every sync fails with "Embedding model X requires Y"
+  # and the test classifier reports unknown failures instead of lock outcomes.
+  ( bun run src/cli.ts sync --dir "$BRAIN_DIR" --no-embed >"$OUT_F" 2>&1; echo $? > "$EXIT_F" ) &
   PIDS+=($!)
 done
 
