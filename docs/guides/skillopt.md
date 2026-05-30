@@ -17,17 +17,18 @@ May 2026).
 ## The 30-second pitch
 
 ```bash
-# 1. Bootstrap a benchmark from existing routing fixtures
-gbrain skillopt my-skill --bootstrap-from-routing
+# 1. Generate a starter benchmark from the skill itself (no routing-eval needed)
+gbrain skillopt my-skill --bootstrap-from-skill
 
-# 2. Review the generated benchmark
-#    Delete the trailing `# BOOTSTRAP_PENDING_REVIEW` line
+# 2. Review the benchmark — STRENGTHEN the generated judges (they're weak drafts),
+#    then delete the trailing `# BOOTSTRAP_PENDING_REVIEW` line
 
-# 3. Run the optimizer
-gbrain skillopt my-skill --bootstrap-reviewed
+# 3. Run the optimizer (--split 1:1:1 is required for a ~15-task starter)
+gbrain skillopt my-skill --bootstrap-reviewed --split 1:1:1
 ```
 
-That's the entire workflow.
+That's the entire workflow. (Already have a `routing-eval.jsonl`? Swap step 1 for
+`--bootstrap-from-routing` — but routing tasks test dispatch, not output quality.)
 
 ## What's in the box
 
@@ -72,6 +73,8 @@ proposal (this lives in v0.42 follow-up; v1 emits the audit event).
 | Flag | Default | Purpose |
 |---|---|---|
 | `--benchmark <path>` | `skills/<n>/skillopt-benchmark.jsonl` | Path to benchmark JSONL |
+| `--bootstrap-from-skill` | off | Generate a starter benchmark from SKILL.md (recommended; no routing-eval needed) |
+| `--bootstrap-tasks N` | 15 | How many starter tasks `--bootstrap-from-skill` generates (max 50) |
 | `--bootstrap-from-routing` | off | Auto-build benchmark from routing-eval.jsonl |
 | `--bootstrap-reviewed` | off | Required after human-reviewing bootstrap output |
 | `--epochs N` | 4 | Outer-loop iterations |
