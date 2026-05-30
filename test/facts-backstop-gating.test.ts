@@ -8,8 +8,9 @@
  * responses.
  */
 
-import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { describe, test, expect, beforeAll, beforeEach, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { resetGateway } from '../src/core/ai/gateway.ts';
 import { dispatchToolCall } from '../src/mcp/dispatch.ts';
 
 let engine: PGLiteEngine;
@@ -19,6 +20,16 @@ beforeAll(async () => {
   await engine.connect({});
   await engine.initSchema();
 });
+
+// Defense-in-depth: this suite tests the FACTS BACKSTOP gating, not embedding.
+// put_page imports + embeds the page body before the backstop runs, and
+// embedding only happens when isAvailable('embedding') is true. If a prior
+// test file in this shard's process left the gateway configured with a key
+// (e.g. embed-preflight's 'sk-test'), put_page would attempt a real embed and
+// 401. Reset the gateway before each test so isAvailable('embedding') is
+// deterministically false → put_page uses noEmbed → the import never embeds →
+// we exercise only the backstop gating the suite is about.
+beforeEach(() => { resetGateway(); });
 
 afterAll(async () => {
   await engine.disconnect();
