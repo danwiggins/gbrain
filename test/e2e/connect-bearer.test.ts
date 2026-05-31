@@ -18,6 +18,7 @@ import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { probeBrainIdentity } from '../../src/core/connect-probe.ts';
+import { discoverOAuth, mintClientCredentialsToken } from '../../src/core/remote-mcp-probe.ts';
 
 const PORT = 19735; // avoid the production 3131 + the oauth E2E's 19131
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -27,6 +28,8 @@ describe('connect bearer probe E2E (PGLite + real serve --http)', () => {
   let home: string;
   let server: ChildProcess | null = null;
   let token = '';
+  let oauthClientId = '';
+  let oauthClientSecret = '';
   let serverReady = false;
 
   beforeAll(async () => {
@@ -41,6 +44,17 @@ describe('connect bearer probe E2E (PGLite + real serve --http)', () => {
     });
     token = (authOut.match(/gbrain_[a-f0-9]{64}/) ?? [''])[0];
     if (!token) throw new Error(`auth create did not yield a token:\n${authOut}`);
+
+    // Register the OAuth client BEFORE spawning serve — PGLite is single-writer,
+    // so register-client can't open the brain once the server holds it.
+    const regOut = execFileSync('bun', [
+      'run', 'src/cli.ts', 'auth', 'register-client', 'e2e-perplexity-oauth',
+      '--grant-types', 'client_credentials', '--scopes', 'read write',
+      '--token-endpoint-auth-method', 'client_secret_post',
+    ], { cwd: process.cwd(), env, encoding: 'utf8' });
+    oauthClientId = (regOut.match(/Client ID:\s+(\S+)/) ?? ['', ''])[1];
+    oauthClientSecret = (regOut.match(/Client Secret:\s+(\S+)/) ?? ['', ''])[1];
+    if (!oauthClientId || !oauthClientSecret) throw new Error(`register-client did not yield creds:\n${regOut}`);
 
     server = spawn('bun', [
       'run', 'src/cli.ts', 'serve', '--http',
@@ -163,4 +177,31 @@ describe('connect bearer probe E2E (PGLite + real serve --http)', () => {
     expect(r.out).toContain(token); // print mode shows the token to paste into the connector
     expect(r.out).toMatch(/Settings.+Connectors/);
   }, 30_000);
+
+  // The OAuth path Perplexity actually uses, proven end-to-end against the live
+  // server: register a client → connect --oauth formats it → mint a real
+  // client-credentials access token via OAuth discovery + /token → call
+  // get_brain_identity with that token. This exercises the whole chain a
+  // Perplexity OAuth connector walks.
+  test('perplexity OAuth: connect --oauth → mint client-credentials token → tool call', async () => {
+    expect(serverReady).toBe(true);
+    // The OAuth client was registered in beforeAll (before serve took the
+    // PGLite write lock). Here: format it, then walk the connector's flow.
+    // 1. `connect --oauth` formats the connector block with the right issuer.
+    const conn = runConnectCli([MCP_URL, '--agent', 'perplexity', '--oauth', '--client-id', oauthClientId, '--client-secret', oauthClientSecret], {});
+    expect(conn.code).toBe(0);
+    expect(conn.out).toContain(`Issuer URL:    ${BASE}`);
+    expect(conn.out).toContain(`Client ID:     ${oauthClientId}`);
+
+    // 2. Mint a real access token the way a connector does, then call a tool.
+    const disco = await discoverOAuth(BASE, { timeoutMs: 10_000 });
+    expect(disco.ok).toBe(true);
+    if (!disco.ok) return;
+    const minted = await mintClientCredentialsToken(disco.metadata.token_endpoint, oauthClientId, oauthClientSecret, { scope: 'read write', timeoutMs: 10_000 });
+    expect(minted.ok).toBe(true);
+    if (!minted.ok) return;
+    const probed = await probeBrainIdentity(MCP_URL, minted.token.access_token, { timeoutMs: 15_000 });
+    expect(probed.ok).toBe(true);
+    if (probed.ok) expect(probed.identity).toMatch(/version/);
+  }, 60_000);
 });

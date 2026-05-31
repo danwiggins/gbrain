@@ -36,30 +36,38 @@ tunnel.
 
 ## 3. Create credentials
 
-Two supported auth paths:
+Two supported auth paths.
 
-**OAuth 2.1 client credentials (recommended, v0.26.0+):**
+**OAuth 2.1 client credentials (recommended, v0.26.0+).** Perplexity is a cloud
+service, so it holds whatever credential you give it. OAuth is the correct choice:
+least-privilege scopes + short-lived rotating access tokens instead of a
+long-lived full-access secret. Mint a client and print the connector fields in
+one step (on the brain host):
+
+```bash
+gbrain connect https://YOUR-DOMAIN.ngrok.app/mcp --agent perplexity --oauth --register
+```
+
+Or register separately and pass the creds (works anywhere, no DB needed):
 
 ```bash
 gbrain auth register-client perplexity --grant-types client_credentials --scopes "read write"
+gbrain connect https://YOUR-DOMAIN.ngrok.app/mcp --agent perplexity --oauth \
+  --client-id gbrain_cl_xxx --client-secret gbrain_cs_xxx
 ```
 
-Save the printed `client_id` + `client_secret`.
+`connect --oauth` prints the **Issuer URL + Client ID + Client Secret** to paste
+in step 4.
 
-**Legacy bearer token (simplest):**
+**Legacy bearer token (simplest, best for local/personal):**
 
 ```bash
 gbrain auth create "perplexity"
-```
-
-`gbrain connect` generates the bearer-token paste values for you:
-
-```bash
 gbrain connect https://YOUR-DOMAIN.ngrok.app/mcp --token gbrain_xxx --agent perplexity
 ```
 
 (Perplexity is a GUI connector, so there's no `--install` — `connect` prints the
-exact URL + token to paste in step 4.)
+exact values to paste in step 4.)
 
 ## 4. Add the connector in Perplexity
 

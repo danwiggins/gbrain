@@ -26,9 +26,15 @@ Pick your agent with `--agent`:
 - **codex**: `codex mcp add <name> --url <url> --bearer-token-env-var
   GBRAIN_REMOTE_TOKEN`. Codex reads the token from the env var at runtime, so the
   secret never lands in Codex's config file. `--install` runs it.
-- **perplexity**: prints the exact URL + token to paste into Perplexity's
-  Settings → Connectors (it's a GUI connector, so no `--install`).
-- **generic**: prints the URL + `Authorization` header for any other MCP client.
+- **perplexity**: prints the exact connector fields to paste into Perplexity's
+  Settings → Connectors (it's a GUI connector, so no `--install`). Defaults to a
+  bearer token, but since Perplexity is a cloud service the recommended path is
+  **OAuth**: `--agent perplexity --oauth --register` mints a least-privilege
+  client and prints the Issuer URL + Client ID + Client Secret. OAuth means the
+  connector mints short-lived, scoped access tokens instead of holding a
+  long-lived full-access secret.
+- **generic**: prints the URL + `Authorization` header (or OAuth fields with
+  `--oauth`) for any other MCP client.
 
 How to use it (run anywhere gbrain is installed):
 
@@ -92,6 +98,14 @@ If anything looks wrong, `gbrain connect --help` lists every flag, and
   a 401, unreachable host, or timeout, so a bad token fails at setup instead of
   on the agent's first request. Supported for claude-code and codex (Perplexity
   is GUI-only).
+- **OAuth client-credentials path (`--oauth`, perplexity + generic).** The
+  correct path when the credential lives on a third-party cloud: instead of a
+  long-lived full-access bearer token, the connector gets an Issuer URL + Client
+  ID + Client Secret and mints its own short-lived, scoped access tokens.
+  `--oauth --register` mints a least-privilege client on the host in one command;
+  `--oauth --client-id X --client-secret Y` uses an existing one (runs anywhere).
+  The full chain (register → OAuth discovery → `/token` → tool call) is proven by
+  a new end-to-end test against a live server.
 
 #### Fixed
 - **`gbrain auth create <name>` no longer drops the name.** On the bare form

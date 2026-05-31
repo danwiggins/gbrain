@@ -12,10 +12,13 @@ import {
   buildConnectBlock,
   buildJson,
   runConnect,
+  issuerFromMcpUrl,
   type ConnectDeps,
   AGENT_IDS,
   ENV_VAR,
+  DEFAULT_SCOPES,
   PLACEHOLDER_TOKEN,
+  PLACEHOLDER_SECRET,
   REDACTED,
   LEARN_INSTRUCTION,
 } from '../src/commands/connect.ts';
@@ -296,6 +299,69 @@ describe('buildJson', () => {
   });
 });
 
+describe('OAuth helpers', () => {
+  test('issuerFromMcpUrl strips /mcp', () => {
+    expect(issuerFromMcpUrl('https://brain.example.com:3131/mcp')).toBe('https://brain.example.com:3131');
+    expect(issuerFromMcpUrl('https://brain.example.com/mcp')).toBe('https://brain.example.com');
+  });
+
+  test('perplexity oauth block: issuer + client id/secret, no bearer header', () => {
+    const block = buildConnectBlock({
+      agent: 'perplexity', name: 'gbrain', url: 'https://h/mcp', token: null,
+      oauth: { issuer: 'https://h', clientId: 'gbrain_cl_x', clientSecret: 'gbrain_cs_y' },
+    });
+    expect(block).toMatch(/Settings.+Connectors/);
+    expect(block).toContain('Issuer URL:    https://h');
+    expect(block).toContain('Client ID:     gbrain_cl_x');
+    expect(block).toContain('Client Secret: gbrain_cs_y');
+    expect(block).toContain('OAuth 2.1 (client credentials)');
+    expect(block).not.toContain('Authorization: Bearer');
+    expect(block).toContain(LEARN_INSTRUCTION);
+  });
+
+  test('generic oauth block emits the OAuth fields', () => {
+    const block = buildConnectBlock({
+      agent: 'generic', name: 'gbrain', url: 'https://h/mcp', token: null,
+      oauth: { issuer: 'https://h', clientId: 'gbrain_cl_x', clientSecret: 'gbrain_cs_y' },
+    });
+    expect(block).toContain('Issuer URL:    https://h');
+    expect(block).toContain('Client ID:     gbrain_cl_x');
+    expect(block).toContain('Client Secret: gbrain_cs_y');
+  });
+
+  test('oauth block placeholders a missing secret', () => {
+    const block = buildConnectBlock({
+      agent: 'perplexity', name: 'gbrain', url: 'https://h/mcp', token: null,
+      oauth: { issuer: 'https://h', clientId: 'gbrain_cl_x', clientSecret: null },
+    });
+    expect(block).toContain(PLACEHOLDER_SECRET);
+  });
+
+  test('buildJson oauth: redacts the secret by default, exposes issuer + scopes', () => {
+    const j = buildJson({
+      url: 'https://h/mcp', name: 'gbrain', agent: 'perplexity', token: null, showToken: false,
+      oauth: { issuer: 'https://h', clientId: 'gbrain_cl_x', clientSecret: 'SeKrEt9' }, scopes: 'read',
+    });
+    expect(j.auth).toBe('oauth');
+    expect(j.issuer_url).toBe('https://h');
+    expect(j.client_id).toBe('gbrain_cl_x');
+    expect(j.client_secret).toBe(REDACTED);
+    expect(j.secret_redacted).toBe(true);
+    expect(j.scopes).toBe('read');
+    expect(j.command).toBeNull();
+    expect(JSON.stringify(j)).not.toContain('SeKrEt9');
+  });
+
+  test('buildJson oauth --show-token reveals the secret', () => {
+    const j = buildJson({
+      url: 'https://h/mcp', name: 'gbrain', agent: 'perplexity', token: null, showToken: true,
+      oauth: { issuer: 'https://h', clientId: 'gbrain_cl_x', clientSecret: 'SeKrEt9' },
+    });
+    expect(j.client_secret).toBe('SeKrEt9');
+    expect(j.scopes).toBe(DEFAULT_SCOPES);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // connect-probe
 // ---------------------------------------------------------------------------
@@ -427,6 +493,7 @@ function installDeps(over: Partial<ConnectDeps> = {}): ConnectDeps {
     runBinary: (_binary, argv) => (argv[1] === 'get' ? { code: 1, stdout: '', stderr: '' } : { code: 0, stdout: '', stderr: '' }),
     probe: async () => ({ ok: true, identity: 'brain: alice-example' }),
     env: () => undefined, // tests control the env; real GBRAIN_REMOTE_TOKEN must not leak in
+    registerOAuthClient: () => ({ ok: true, clientId: 'gbrain_cl_minted', clientSecret: 'gbrain_cs_minted' }),
     ...over,
   };
 }
@@ -682,5 +749,96 @@ describe('runConnect print mode', () => {
 describe('AGENT_IDS', () => {
   test('exposes the four supported agents', () => {
     expect(AGENT_IDS).toEqual(['claude-code', 'codex', 'perplexity', 'generic']);
+  });
+});
+
+describe('runConnect --oauth', () => {
+  test('perplexity --oauth with BYO client id/secret prints the OAuth connector block', async () => {
+    const r = await runWithExitCapture(
+      ['https://brain.example.com/mcp', '--agent', 'perplexity', '--oauth', '--client-id', 'gbrain_cl_x', '--client-secret', 'gbrain_cs_y'],
+      installDeps(),
+    );
+    expect(r.exitCode).toBeUndefined();
+    const out = r.out.join('\n');
+    expect(out).toContain('Issuer URL:    https://brain.example.com');
+    expect(out).toContain('Client ID:     gbrain_cl_x');
+    expect(out).toContain('Client Secret: gbrain_cs_y');
+  });
+
+  test('perplexity --oauth --register mints a client via the host and prints it', async () => {
+    const r = await runWithExitCapture(
+      ['https://brain.example.com/mcp', '--agent', 'perplexity', '--oauth', '--register'],
+      installDeps(), // registerOAuthClient → gbrain_cl_minted / gbrain_cs_minted
+    );
+    expect(r.exitCode).toBeUndefined();
+    const out = r.out.join('\n');
+    expect(out).toContain('Client ID:     gbrain_cl_minted');
+    expect(out).toContain('Client Secret: gbrain_cs_minted');
+  });
+
+  test('perplexity --oauth --register --json redacts the secret by default', async () => {
+    const r = await runWithExitCapture(
+      ['https://brain.example.com/mcp', '--agent', 'perplexity', '--oauth', '--register', '--json'],
+      installDeps({ registerOAuthClient: () => ({ ok: true, clientId: 'gbrain_cl_x', clientSecret: 'gbrain_cs_secret' }) }),
+    );
+    const j = JSON.parse(r.out.join('\n'));
+    expect(j.auth).toBe('oauth');
+    expect(j.client_secret).toBe(REDACTED);
+    expect(r.out.join('\n')).not.toContain('gbrain_cs_secret');
+  });
+
+  test('--oauth without creds or --register fails with guidance', async () => {
+    const r = await runWithExitCapture(
+      ['https://brain.example.com/mcp', '--agent', 'perplexity', '--oauth'],
+      installDeps(),
+    );
+    expect(r.exitCode).toBe(1);
+    expect(r.err.join('\n')).toMatch(/--register/);
+    expect(r.err.join('\n')).toMatch(/--client-id/);
+  });
+
+  test('--oauth with only --client-id fails (needs both)', async () => {
+    const r = await runWithExitCapture(
+      ['https://brain.example.com/mcp', '--agent', 'perplexity', '--oauth', '--client-id', 'gbrain_cl_x'],
+      installDeps(),
+    );
+    expect(r.exitCode).toBe(1);
+    expect(r.err.join('\n')).toMatch(/BOTH --client-id and --client-secret/);
+  });
+
+  test('register failure surfaces the manual register-client command', async () => {
+    const r = await runWithExitCapture(
+      ['https://brain.example.com/mcp', '--agent', 'perplexity', '--oauth', '--register'],
+      installDeps({ registerOAuthClient: () => ({ ok: false, message: 'No database connection' }) }),
+    );
+    expect(r.exitCode).toBe(1);
+    expect(r.err.join('\n')).toMatch(/gbrain auth register-client/);
+  });
+
+  test('--oauth is rejected for claude-code (uses bearer)', async () => {
+    const r = await runWithExitCapture(
+      ['https://brain.example.com/mcp', '--agent', 'claude-code', '--oauth', '--register'],
+      installDeps(),
+    );
+    expect(r.exitCode).toBe(1);
+    expect(r.err.join('\n')).toMatch(/connector-style/);
+  });
+
+  test('--oauth is rejected for codex (uses bearer)', async () => {
+    const r = await runWithExitCapture(
+      ['https://brain.example.com/mcp', '--agent', 'codex', '--oauth', '--register'],
+      installDeps(),
+    );
+    expect(r.exitCode).toBe(1);
+    expect(r.err.join('\n')).toMatch(/connector-style/);
+  });
+
+  test('--oauth + --install is rejected', async () => {
+    const r = await runWithExitCapture(
+      ['https://brain.example.com/mcp', '--agent', 'perplexity', '--oauth', '--register', '--install', '--yes'],
+      installDeps(),
+    );
+    expect(r.exitCode).toBe(1);
+    expect(r.err.join('\n')).toMatch(/--install is not supported with --oauth/);
   });
 });
