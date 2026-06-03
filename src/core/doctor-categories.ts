@@ -137,6 +137,7 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'rls',
   'rls_event_trigger',
   'search_mode',
+  'self_upgrade_health',
   'stale_locks',
   'subagent_capability',
   'subagent_health',

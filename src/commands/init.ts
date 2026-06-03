@@ -937,6 +937,10 @@ async function initPGLite(opts: {
     // PR1: new installs publish their skill catalog over MCP by default
     // (existing config wins on re-init, so a prior opt-out is preserved).
     config.mcp = { publish_skills: true, ...(config.mcp ?? {}) };
+    // v0.42: new installs default self-upgrade to NOTIFY (a nudge on every
+    // gbrain invocation). mode_prompted=true so the upgrade-time banner doesn't
+    // also fire on a fresh install. Hands-off: gbrain config set self_upgrade.mode auto
+    config.self_upgrade = { mode: 'notify', mode_prompted: true, ...(config.self_upgrade ?? {}) };
     saveConfig(config);
     if (opts.schemaPack) {
       process.stderr.write(
@@ -1177,6 +1181,10 @@ async function initPostgres(opts: {
     // PR1: new installs publish their skill catalog over MCP by default
     // (existing config wins on re-init, so a prior opt-out is preserved).
     config.mcp = { publish_skills: true, ...(config.mcp ?? {}) };
+    // v0.42: new installs default self-upgrade to NOTIFY (a nudge on every
+    // gbrain invocation). mode_prompted=true so the upgrade-time banner doesn't
+    // also fire on a fresh install. Hands-off: gbrain config set self_upgrade.mode auto
+    config.self_upgrade = { mode: 'notify', mode_prompted: true, ...(config.self_upgrade ?? {}) };
     saveConfig(config);
     console.log('Config saved to ~/.gbrain/config.json');
     if (opts.schemaPack) {
