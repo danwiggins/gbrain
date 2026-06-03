@@ -2019,12 +2019,29 @@ const get_brain_identity: Operation = {
   params: {},
   handler: async (ctx) => {
     const stats = await ctx.engine.getStats();
+    // v0.42 self-upgrade: surface a pending update on the thin-client banner
+    // (bonus channel; the CLI stderr marker + `gbrain self-upgrade` are the
+    // load-bearing surface). Cache-read-only, no network, fail-open.
+    let update_available = false;
+    let latest_version: string | null = null;
+    try {
+      const su = await import('./self-upgrade.ts');
+      const entry = su.readUpdateCache();
+      if (entry && su.isCacheFresh(entry, Date.now()) && entry.marker.kind === 'upgrade_available') {
+        update_available = true;
+        latest_version = entry.marker.latest ?? null;
+      }
+    } catch {
+      /* never let the banner break the op */
+    }
     return {
       version: VERSION,
       engine: ctx.engine.kind,
       page_count: stats.page_count,
       chunk_count: stats.chunk_count,
       last_sync_iso: null as string | null,
+      update_available,
+      latest_version,
     };
   },
   scope: 'read',

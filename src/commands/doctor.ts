@@ -756,7 +756,71 @@ export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorRep
   //   - Three-state: ok / warn / fail.
   checks.push(await checkFederationHealth(engine));
 
+  // 13. v0.42 self_upgrade_health: mode, whether behind, recent failures.
+  // File-plane only (no engine) — works on thin clients too.
+  checks.push(checkSelfUpgradeHealth());
+
   return computeDoctorReport(checks);
+}
+
+/**
+ * v0.42 self_upgrade_health. Surfaces the self-upgrade mode, whether an update
+ * is pending (from the cache), and any recent failed auto-upgrade attempts.
+ * File-plane only (no DB) so it runs on thin clients. Three-state: warn on
+ * recent failures, otherwise ok.
+ */
+export function checkSelfUpgradeHealth(): Check {
+  try {
+    const { loadConfig } = require('../core/config.ts');
+    const {
+      resolveSelfUpgradeMode,
+      readUpdateCache,
+      isCacheFresh,
+    } = require('../core/self-upgrade.ts');
+    const { readRecentSelfUpgrades } = require('../core/audit/self-upgrade-audit.ts');
+
+    const cfg = loadConfig();
+    const mode = resolveSelfUpgradeMode(cfg);
+    if (mode === 'off') {
+      return {
+        name: 'self_upgrade_health',
+        status: 'ok',
+        message: 'Self-upgrade disabled (mode=off). Enable: gbrain config set self_upgrade.mode notify',
+      };
+    }
+
+    const parts: string[] = [`mode=${mode}`];
+    const entry = readUpdateCache();
+    if (entry && isCacheFresh(entry, Date.now()) && entry.marker.kind === 'upgrade_available') {
+      parts.push(`update available: ${entry.marker.current} -> ${entry.marker.latest} (run: gbrain self-upgrade)`);
+    }
+    const failedVersions: string[] = cfg?.self_upgrade?.failed_versions ?? [];
+    if (failedVersions.length > 0) {
+      parts.push(`skipping known-bad: ${failedVersions.join(', ')}`);
+    }
+
+    const recent = readRecentSelfUpgrades(7) as Array<{ outcome?: string; error?: string; latest?: string | null }>;
+    const failures = recent.filter((e) => e.outcome === 'failed');
+    if (failures.length > 0) {
+      const last = failures[failures.length - 1];
+      return {
+        name: 'self_upgrade_health',
+        status: 'warn',
+        message:
+          `${failures.length} self-upgrade failure(s) in 7d (${parts.join('; ')}). ` +
+          `Last: ${last.latest ?? '?'}${last.error ? ` — ${last.error}` : ''}. ` +
+          `Check ~/.gbrain/upgrade-errors.jsonl; apply manually with gbrain self-upgrade.`,
+      };
+    }
+
+    return { name: 'self_upgrade_health', status: 'ok', message: parts.join('; ') };
+  } catch (e) {
+    return {
+      name: 'self_upgrade_health',
+      status: 'ok',
+      message: `Self-upgrade status unavailable (${e instanceof Error ? e.message : String(e)})`,
+    };
+  }
 }
 
 // --- v0.36.1.0 calibration doctor checks (T12) ---
