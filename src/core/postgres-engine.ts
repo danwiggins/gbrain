@@ -94,12 +94,8 @@ export class PostgresEngine implements BrainEngine {
   private _sql: ReturnType<typeof postgres> | null = null;
   /** Saved config for reconnection. */
   private _savedConfig: (EngineConfig & { poolSize?: number; parentConnectionManager?: ConnectionManager }) | null = null;
-  /**
-   * In-flight reconnect, shared so concurrent callers AWAIT the active reconnect
-   * rather than returning immediately against a half-rebuilt pool (#1570 codex
-   * #5 — the prior `_reconnecting` boolean made the 2nd caller a no-op return).
-   */
-  private _reconnectPromise: Promise<void> | null = null;
+  /** Whether a reconnect is in progress (prevents concurrent reconnects). */
+  private _reconnecting = false;
   /**
    * #1471: module-singleton OWNERSHIP token. `true` only for the engine whose
    * connect() actually created the shared db.ts `sql` singleton (returned
@@ -2011,9 +2007,8 @@ export class PostgresEngine implements BrainEngine {
         },
         // v0.41.25.0 (#1570): on null-singleton retryable errors, rebuild
         // the connection BEFORE the inter-attempt sleep so the next attempt
-        // sees a live pool. `this.reconnect()` is race-safe via the shared
-        // `_reconnectPromise` (concurrent callers await it), handles both
-        // module and instance pools,
+        // sees a live pool. `this.reconnect()` is race-safe via the
+        // `_reconnecting` guard, handles both module and instance pools,
         // and is a fast no-op when the underlying client is still healthy
         // (postgres.js's own connection-replacement covers that case).
         // Fail-loud per retry.ts contract: a reconnect throw propagates
@@ -4809,59 +4804,79 @@ export class PostgresEngine implements BrainEngine {
   }
 
   /**
-   * Reconnect the engine by tearing down the current pool and creating a fresh
-   * one. No-ops if there is no saved config (never connected). Concurrent
-   * callers share one in-flight reconnect (#1404/#1471 codex #5): the prior
-   * `_reconnecting` boolean returned the 2nd caller immediately, so its retry
-   * could fire against a half-rebuilt pool. The shared `_reconnectPromise`
-   * makes every caller AWAIT the single reconnect. Ownership re-samples through
-   * the atomic db.connect() token on the connect() leg — owner re-acquires,
-   * borrower re-borrows.
+   * Reconnect the engine after a transient connection blip. Branches on
+   * connection style; no-ops if no saved config or if already reconnecting.
    *
-   * v0.42.x (#1685 GAP B): records a pool-recovery audit event so the
-   * `pool_reap_health` doctor check can answer "reaped N times AND not
-   * auto-recovering." `ctx.error` (threaded by retry.ts) is classified: a
-   * CONNECTION_ENDED match is a true pooler reap; anything else (or no error,
-   * e.g. the supervisor's health-check reconnect) is `reconnect_other`. All
-   * audit calls are best-effort and never block the reconnect (CODEX #8).
+   * - MODULE-singleton engines SHARE `db.ts`'s `sql` (#1745). Calling
+   *   `db.disconnect()` here (via `this.disconnect()`) would null it out from
+   *   under EVERY concurrent op (other dream-cycle phases, minion-queue
+   *   `promoteDelayed`), which then throw "connect() has not been called" in the
+   *   disconnect→connect window. postgres.js already auto-replaces dead sockets
+   *   inside its pool, so a transient blip recovers WITHOUT a teardown. Recover
+   *   idempotently instead: `db.connect()` is a no-op when the singleton is alive
+   *   (the common case) and re-establishes it only if some other path nulled it —
+   *   never introducing a null window — then refreshes the ConnectionManager read
+   *   pool. Scope: fixes the singleton-NULL-window bug specifically; it does NOT
+   *   rebuild a genuinely WEDGED-but-live pool (db.connect() no-ops there) — a
+   *   different failure mode postgres.js owns.
+   *
+   * - INSTANCE pools (worker engines, `poolSize` set) own their `_sql` — tearing
+   *   it down and rebuilding is correct and isolated; nobody else shares it. This
+   *   path also records a pool-recovery audit event (#1685 GAP B) so the
+   *   `pool_reap_health` doctor check can answer "reaped N times AND not
+   *   auto-recovering." `ctx.error` (threaded by retry.ts) is classified: a
+   *   CONNECTION_ENDED match is a true pooler reap; anything else (or no error,
+   *   e.g. the supervisor's health-check reconnect) is `reconnect_other`. All
+   *   audit calls are best-effort and never block the reconnect (CODEX #8).
    */
   async reconnect(ctx?: { error?: unknown }): Promise<void> {
-    if (!this._savedConfig) return;
-    if (this._reconnectPromise) return this._reconnectPromise;
-    const saved = this._savedConfig;
-    this._reconnectPromise = (async () => {
-      let isReap = false;
-      if (ctx?.error !== undefined) {
-        try {
-          const { isConnectionEndedError } = await import('./retry-matcher.ts');
-          isReap = isConnectionEndedError(ctx.error);
-        } catch { /* classification is best-effort */ }
-      }
+    if (!this._savedConfig || this._reconnecting) return;
+    if (this._connectionStyle !== 'instance') {
+      // Module-singleton: never tear down the shared pool. db.connect() is
+      // idempotent (no-op when the singleton is alive — the common #1745 path).
+      // FAIL-LOUD (codex): do NOT swallow a real connect failure — a swallowed
+      // error would make reconnect() resolve "successfully" and let the
+      // supervisor reset its health-failure counter / emit db_reconnected when
+      // the DB is actually down. A throw propagates as the real cause (matches
+      // the withRetry+reconnect contract and the instance path's posture).
+      await db.connect(this._savedConfig);
+      // If db.connect() RE-CREATED the singleton (another path nulled it), the
+      // ConnectionManager set at connect-time still points at the ended old
+      // pool. Refresh it. Idempotent no-op when the singleton was already alive.
+      this.connectionManager?.setReadPool(db.getConnection());
+      return;
+    }
+    this._reconnecting = true;
+
+    let isReap = false;
+    if (ctx?.error !== undefined) {
+      try {
+        const { isConnectionEndedError } = await import('./retry-matcher.ts');
+        isReap = isConnectionEndedError(ctx.error);
+      } catch { /* classification is best-effort */ }
+    }
+    try {
+      const { logPoolRecovery } = await import('./audit/pool-recovery-audit.ts');
+      logPoolRecovery(isReap ? 'reap_detected' : 'reconnect_other', ctx?.error);
+    } catch { /* audit is best-effort */ }
+
+    try {
+      // Instance pool: tear down old pool (best-effort — it may already be dead).
+      try { await this.disconnect(); } catch { /* swallow */ }
+      await this.connect(this._savedConfig);
       try {
         const { logPoolRecovery } = await import('./audit/pool-recovery-audit.ts');
-        logPoolRecovery(isReap ? 'reap_detected' : 'reconnect_other', ctx?.error);
-      } catch { /* audit is best-effort */ }
-
+        logPoolRecovery('reconnect_succeeded');
+      } catch { /* best-effort */ }
+    } catch (err) {
       try {
-        // Tear down old pool (best-effort — it may already be dead)
-        try { await this.disconnect(); } catch { /* swallow */ }
-        // Create fresh pool
-        await this.connect(saved);
-        try {
-          const { logPoolRecovery } = await import('./audit/pool-recovery-audit.ts');
-          logPoolRecovery('reconnect_succeeded');
-        } catch { /* best-effort */ }
-      } catch (err) {
-        try {
-          const { logPoolRecovery } = await import('./audit/pool-recovery-audit.ts');
-          logPoolRecovery('reconnect_failed', err);
-        } catch { /* best-effort */ }
-        throw err;
-      } finally {
-        this._reconnectPromise = null;
-      }
-    })();
-    return this._reconnectPromise;
+        const { logPoolRecovery } = await import('./audit/pool-recovery-audit.ts');
+        logPoolRecovery('reconnect_failed', err);
+      } catch { /* best-effort */ }
+      throw err;
+    } finally {
+      this._reconnecting = false;
+    }
   }
 
   async executeRaw<T = Record<string, unknown>>(

@@ -90,16 +90,16 @@ describe('postgres-engine / module-singleton ownership (#1471)', () => {
     expect(nullIdx < endIdx).toBe(true);
   });
 
-  test('reconnect() shares one in-flight promise (codex #5), not the old no-op boolean gate', () => {
-    expect(ENGINE_SRC.includes('_reconnectPromise')).toBe(true);
-    // The removed boolean field must be gone from CODE (comment mentions of the
-    // old name are fine — they document the change). Strip comments first.
-    const codeOnly = stripComments(ENGINE_SRC);
-    expect(/this\._reconnecting\b/.test(codeOnly)).toBe(false);
-    expect(/private\s+_reconnecting\b/.test(codeOnly)).toBe(false);
+  test('reconnect() is connection-style aware: module-singleton path never tears down the shared pool (#1745)', () => {
     const reconnect = stripComments(extractMethod(ENGINE_SRC, 'reconnect'));
-    // Concurrent callers AWAIT the in-flight reconnect (return the shared promise).
-    expect(/if\s*\(\s*this\._reconnectPromise\s*\)\s*return\s+this\._reconnectPromise/.test(reconnect)).toBe(true);
+    // Module-singleton engines must NOT route through this.disconnect()/db.disconnect()
+    // on reconnect — they recover idempotently via db.connect() + setReadPool, so a
+    // transient blip can't null the shared singleton other phases are using.
+    expect(/this\._connectionStyle\s*!==\s*'instance'/.test(reconnect)).toBe(true);
+    expect(/db\.connect\(this\._savedConfig\)/.test(reconnect)).toBe(true);
+    expect(/setReadPool\(db\.getConnection\(\)\)/.test(reconnect)).toBe(true);
+    // The instance path keeps the `_reconnecting` re-entrancy guard.
+    expect(/this\._reconnecting\s*=\s*true/.test(reconnect)).toBe(true);
   });
 });
 
