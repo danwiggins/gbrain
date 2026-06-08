@@ -23,6 +23,7 @@ import {
   type AdaptiveReturnDecision,
 } from './return-policy.ts';
 import { applyAutocut, type AutocutDecision } from './autocut.ts';
+import { buildRelationalArm } from './relational-recall.ts';
 import { loadConfigWithEngine } from '../config.ts';
 import { dedupResults } from './dedup.ts';
 import { applyReranker } from './rerank.ts';
@@ -664,6 +665,9 @@ export async function applyAliasHop(
 
 export interface HybridSearchOpts extends SearchOpts {
   expansion?: boolean;
+  /** v0.43 — observability sink for the relational recall arm (fired/no-op,
+   *  kind, seeds resolved, candidates, errored). Best-effort. */
+  onRelationalMeta?: (meta: import('./relational-recall.ts').RelationalArmMeta) => void;
   /**
    * T4/D5 — per-call search-mode selector (one of SEARCH_MODES). Selects the
    * whole mode bundle for this call, overriding the server-configured mode.
@@ -806,6 +810,11 @@ export async function hybridSearch(
       // Non-boolean AutocutInput shapes (Partial) aren't a v1 per-call surface,
       // so only the boolean toggle threads here.
       autocut: typeof opts?.autocut === 'boolean' ? opts.autocut : undefined,
+      // v0.43 — relational recall per-call thread-through. Per-call wins over
+      // config override wins over mode bundle; without this the A/B eval gate
+      // would be a no-op (both branches resolve to the same mode default).
+      relationalRetrieval: opts?.relationalRetrieval,
+      relational_retrieval_depth: opts?.relationalRetrievalDepth,
     },
   });
 
@@ -1266,6 +1275,28 @@ export async function hybridSearch(
       ...vectorLists.map(list => ({ list, k: vectorK })),
       { list: keywordResults, k: keywordK },
     ];
+
+  // v0.43 — relational recall arm (fourth RRF arm). Fires only when the mode
+  // enables it AND the query is text-shaped (E4: no-op in image-only mode).
+  // Parsed from the ORIGINAL query (never expanded variants) so it's
+  // deterministic. Empty list = pure no-op for non-relational queries. Rides
+  // every downstream stage (cosine re-score, post-fusion boosts, dedup,
+  // reranker, autocut, token budget) like any other arm.
+  if (resolvedMode.relationalRetrieval && effectiveModality !== 'image') {
+    const relationalList = await buildRelationalArm(engine, query, {
+      sourceId: opts?.sourceId,
+      sourceIds: opts?.sourceIds,
+      depth: resolvedMode.relational_retrieval_depth,
+      limit: opts?.limit ?? resolvedMode.searchLimit,
+      onMeta: opts?.onRelationalMeta,
+    });
+    if (relationalList.length > 0) {
+      // Neutral weight: competes evenly with keyword/vector (baseRrfK), not
+      // dominating. Calibrated against the Commit 5 A/B.
+      allLists.push({ list: relationalList, k: baseRrfK });
+    }
+  }
+
   let fused = rrfFusionWeighted(allLists, detail !== 'high');
 
   // Cosine re-scoring before dedup so semantically better chunks survive.
@@ -1511,6 +1542,11 @@ export async function hybridSearchCached(
       // this, an `autocut:false` (full top-K) call could be served a trimmed
       // autocut-on cache row, or vice versa.
       autocut: typeof opts?.autocut === 'boolean' ? opts.autocut : undefined,
+      // v0.43 — relational recall per-call thread-through. Per-call wins over
+      // config override wins over mode bundle; without this the A/B eval gate
+      // would be a no-op (both branches resolve to the same mode default).
+      relationalRetrieval: opts?.relationalRetrieval,
+      relational_retrieval_depth: opts?.relationalRetrievalDepth,
     },
   });
   // v0.36 (D8 / CDX-2 + codex /ship #4): resolve column for the cache
@@ -1607,7 +1643,7 @@ export async function hybridSearchCached(
   }
 
   if (!skipCache && queryEmbedding && cacheStatus !== 'disabled') {
-    const hit = await cache.lookup(queryEmbedding, { sourceId: opts?.sourceId, knobsHash: cacheKnobsHash });
+    const hit = await cache.lookup(queryEmbedding, { sourceId: cacheScopeKey(opts), knobsHash: cacheKnobsHash });
     if (hit.hit && hit.results) {
       cacheStatus = 'hit';
       cacheSimilarity = hit.similarity;
@@ -1708,12 +1744,48 @@ export async function hybridSearchCached(
   ) {
     trackCacheWrite(
       cache
-        .store(query, queryEmbedding, results, finalMeta, { sourceId: opts?.sourceId, knobsHash: cacheKnobsHash })
+        .store(query, queryEmbedding, results, finalMeta, { sourceId: cacheScopeKey(opts), knobsHash: cacheKnobsHash })
         .catch(() => { /* swallow */ }),
     );
   }
 
   return budgeted;
+}
+
+/**
+ * RRF/dedup identity for a result row, at chunk granularity.
+ *
+ * Includes `source_id` so two same-slug pages in different federated sources
+ * don't collapse into one fusion entry (the same composite-key discipline
+ * `dedup.ts:pageKey` already uses at page granularity). Pre-fix the key was
+ * `slug:chunk_id`, which silently merged cross-source rows and let a
+ * synthetic chunkless row (chunk_id null) key on a text prefix; the
+ * `(source_id, slug, chunk_id)` shape is collision-safe for both.
+ */
+function rrfKey(r: SearchResult): string {
+  const source = r.source_id ?? 'default';
+  return `${source}:${r.slug}:${r.chunk_id ?? r.chunk_text.slice(0, 50)}`;
+}
+
+/**
+ * Canonical query-cache scope key.
+ *
+ * The semantic cache stores results keyed by `(scope, query, knobs_hash)`.
+ * A federated search (`sourceIds`) reads a different graph than a
+ * single-source one, so the two must never share a cache row. Pre-fix the
+ * cache only saw scalar `sourceId`; a federated query fell through to
+ * `'default'` and could cross-serve an unrelated scope.
+ *
+ *   - federated (sourceIds set) → `__set__:` + sorted, comma-joined ids
+ *     (order-independent; two different source-sets get distinct keys)
+ *   - scalar sourceId           → the id itself (single-source unchanged)
+ *   - unscoped                  → `'default'` (single-source brains unchanged)
+ */
+export function cacheScopeKey(opts?: { sourceId?: string; sourceIds?: string[] }): string {
+  if (opts?.sourceIds && opts.sourceIds.length > 0) {
+    return '__set__:' + [...opts.sourceIds].sort().join(',');
+  }
+  return opts?.sourceId ?? 'default';
 }
 
 /**
@@ -1731,7 +1803,7 @@ export function rrfFusionWeighted(
   for (const { list, k } of lists) {
     for (let rank = 0; rank < list.length; rank++) {
       const r = list[rank];
-      const key = `${r.slug}:${r.chunk_id ?? r.chunk_text.slice(0, 50)}`;
+      const key = rrfKey(r);
       const existing = scores.get(key);
       const rrfScore = 1 / (k + rank);
 
@@ -1771,7 +1843,7 @@ export function rrfFusion(lists: SearchResult[][], k: number, applyBoost = true)
   for (const list of lists) {
     for (let rank = 0; rank < list.length; rank++) {
       const r = list[rank];
-      const key = `${r.slug}:${r.chunk_id ?? r.chunk_text.slice(0, 50)}`;
+      const key = rrfKey(r);
       const existing = scores.get(key);
       const rrfScore = 1 / (k + rank);
 
