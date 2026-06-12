@@ -40,6 +40,25 @@ are the bar). Plan + GSTACK REVIEW REPORT at
   make progress. If observed: id-batched chunks (`DELETE ... WHERE id IN
   (SELECT ... LIMIT 10000)` looped). **Where:**
   `src/core/context/volunteer-events.ts:purgeStaleVolunteerEvents`.
+- [ ] **P3 — route `gbrain watch` through the serve resolve-IPC on PGLite.**
+  `watch` connects directly, so on a PGLite brain it monopolizes the single
+  connection for its whole (potentially hours-long) session — a concurrent
+  `gbrain serve` or any write path blocks on the lock until watch exits.
+  WATCH_HELP documents the monopoly; the fix is an IPC rung in watch's
+  resolver (reuse `resolveViaIpc` like the ambient reflex's ladder) so a
+  running serve answers and watch never takes the lock. **Why:** watch +
+  serve concurrently is the natural agent topology. **Where:**
+  `src/commands/watch.ts`, `src/core/context/resolve-ipc.ts` (red-team RT2).
+- [ ] **P3 — capability/version gate for host-injected reflex resolvers.**
+  Windowing switched the orchestrator's suppression request to 'slug-only';
+  a host resolver built against the pre-window contract that still applies
+  title-whole-word suppression silently self-suppresses every windowed
+  entity. The contract is documented at `ResolveEntitiesFn` (reflex.ts), but
+  nothing detects a stale host. Add a capability handshake (e.g. resolver
+  advertises `supportsSuppressionModes`) and fall back to
+  `window_turns: 1` semantics when absent. **Where:**
+  `src/core/context/reflex.ts:ResolveEntitiesFn` + the OpenClaw plugin
+  contract (red-team RT4).
 
 ## gbrain triage wave follow-ups (filed v0.42.41.0)
 

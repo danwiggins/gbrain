@@ -104,16 +104,6 @@ export interface ResolvePointersOpts {
    * arm uses source_id = ANY(...) in one query.
    */
   sourceIds?: string[];
-  /**
-   * v0.43 (#2095, codex D11) — when set, fire-and-forget a volunteer event
-   * per returned pointer on this channel (through the drained
-   * volunteer-events sink). Set by the REFLEX server-side paths (serve IPC,
-   * direct Postgres) so `volunteer-context --stats` measures the default-on
-   * ambient channel. The volunteer layer does NOT set it — it logs its own
-   * events with boosted confidence. Host-injected resolvers (no gbrain
-   * engine) can't log; documented gap.
-   */
-  logChannel?: 'reflex';
 }
 
 interface PageRow {
@@ -283,23 +273,6 @@ export async function resolveEntitiesToPointers(
   }
 
   if (!pointers.length) return null;
-
-  // v0.43 (#2095, codex D11): ambient-channel feedback logging. Lazy import
-  // keeps the reflex hot path dependency-free when logging is off.
-  if (opts.logChannel) {
-    try {
-      const { logVolunteerEventsFireAndForget, volunteerEventRowsFrom } = await import('./volunteer-events.ts');
-      logVolunteerEventsFireAndForget(
-        engine,
-        volunteerEventRowsFrom(
-          pointers.map((p) => ({ ...p, rationale: `${p.arm} match "${p.display}"` })),
-          { channel: opts.logChannel as 'reflex' },
-        ),
-      );
-    } catch {
-      /* telemetry only — never blocks the pointer block */
-    }
-  }
   return { pointers, text: renderPointerBlock(pointers) };
 }
 
@@ -364,4 +337,31 @@ export function renderPointerBlock(pointers: ReflexPointer[]): string {
     lines.push(`- **${p.display}** → \`${p.slug}\`${syn} (use get_page before relying on details)`);
   }
   return lines.join('\n');
+}
+
+/**
+ * v0.43 (#2095, codex D11 + red-team) — ambient-channel feedback logging,
+ * ACCEPT-SIDE ONLY. Called by the delivery points (the serve IPC server after
+ * a successful write; the direct-Postgres reflex rung after its per-turn
+ * timeout admitted the block) — never inside the resolver itself, because a
+ * pointer block that timed out client-side was NEVER injected into a prompt,
+ * and logging it would inflate "volunteered" counts and drag the measured
+ * precision toward zero (corrupting the exact stats users tune
+ * min_confidence with).
+ */
+export function logDeliveredReflexPointers(engine: BrainEngine, pointers: ReflexPointer[]): void {
+  if (!pointers.length) return;
+  void import('./volunteer-events.ts')
+    .then(({ logVolunteerEventsFireAndForget, volunteerEventRowsFrom }) => {
+      logVolunteerEventsFireAndForget(
+        engine,
+        volunteerEventRowsFrom(
+          pointers.map((p) => ({ ...p, rationale: `${p.arm} match "${p.display}"` })),
+          { channel: 'reflex' },
+        ),
+      );
+    })
+    .catch(() => {
+      /* telemetry only */
+    });
 }

@@ -41,7 +41,17 @@ export interface ResolveEntitiesOpts {
   suppression?: 'slug-and-title' | 'slug-only';
 }
 
-/** Host capability shape (D1=A): candidates in, pointers out. Narrow by design. */
+/**
+ * Host capability shape (D1=A): candidates in, pointers out. Narrow by design.
+ *
+ * CONTRACT (red-team): a host resolver MUST honor `opts.suppression`. Under
+ * windowing the orchestrator passes 'slug-only' — a resolver that keeps
+ * applying the legacy title-whole-word rule will suppress every entity merely
+ * mentioned in a prior window turn and silently disable the feature. Hosts
+ * built against the pre-window contract should be upgraded or pinned to
+ * `retrieval_reflex_window_turns: 1`. (A capability/version gate so the
+ * orchestrator can detect a stale host is a filed TODO.)
+ */
 export type ResolveEntitiesFn = (
   candidates: EntityCandidate[],
   opts: ResolveEntitiesOpts,
@@ -117,6 +127,18 @@ export async function buildReflexAddition(params: ReflexParams): Promise<string 
     const block = await withTimeout(resolve(params, cfg, candidates, opts), TIMEOUT_MS);
     if (!block || !block.pointers.length) return null;
 
+    // Accept-side reflex-channel logging (red-team): the block survived the
+    // per-turn timeout, so these pointers ARE being injected. Only the
+    // direct-Postgres rung has an engine here; the IPC rung logs server-side
+    // at delivery; host-injected resolvers can't log (documented gap).
+    if (!params.resolveEntities && isPostgres(cfg)) {
+      const engine = await getPostgresEngine(cfg);
+      if (engine) {
+        const { logDeliveredReflexPointers } = await import('./retrieval-reflex.ts');
+        logDeliveredReflexPointers(engine, block.pointers);
+      }
+    }
+
     writeHeartbeat(cfg, block.pointers.length);
     return block.text;
   } catch {
@@ -146,9 +168,7 @@ async function resolve(
     if (!engine) return null;
     const { resolveSourceId } = await import('../source-resolver.ts');
     const sourceId = await resolveSourceId(engine, null, params.workspaceDir);
-    // logChannel (codex D11): the ambient reflex channel logs its volunteered
-    // pointers so `volunteer-context --stats` measures the default-on path.
-    return resolveEntitiesToPointers(engine, sourceId, candidates, { ...opts, logChannel: 'reflex' });
+    return resolveEntitiesToPointers(engine, sourceId, candidates, opts);
   }
   // 4. Disabled (PGLite with no serve / unknown engine). Policy skill carries.
   return null;

@@ -59,6 +59,13 @@ export interface VolunteerOpts {
   sourceIds: string[];
   /** Prior context (already-surfaced pointers/pages) for slug-only suppression. */
   priorContext?: string;
+  /**
+   * Slugs to skip BEFORE the confidence gate and the maxPages cap (O(1)
+   * membership). `gbrain watch` passes its session-dedupe set here — a
+   * post-call filter would let a recurring already-pushed entity consume cap
+   * slots every turn and starve new pages behind it (red-team finding).
+   */
+  excludeSlugs?: ReadonlySet<string>;
   maxPages?: number;
   minConfidence?: number;
 }
@@ -151,6 +158,7 @@ export async function volunteerContext(
 
   const out: VolunteeredPage[] = [];
   for (const p of block.pointers) {
+    if (opts.excludeSlugs?.has(p.slug)) continue; // before gate + cap — see VolunteerOpts
     // matchedNorm is the resolver's provenance join-key (the candidate that
     // resolved the pointer); display-based lookup is the fallback for the
     // rare suffix rows where provenance couldn't be recovered.

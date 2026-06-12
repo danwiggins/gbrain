@@ -290,8 +290,9 @@ describe('v0.43 (#2095) — rolling window extraction through assemble()', () =>
   });
 });
 
-describe('ambient-channel event logging (codex D11 — logChannel: reflex)', () => {
-  test('resolver with logChannel logs channel=reflex events through the drained sink', async () => {
+describe('ambient-channel event logging (codex D11 — accept-side logDeliveredReflexPointers)', () => {
+  test('logDeliveredReflexPointers logs channel=reflex events through the drained sink', async () => {
+    const { logDeliveredReflexPointers } = await import('../src/core/context/retrieval-reflex.ts');
     const { awaitPendingVolunteerEventWrites, _resetPendingVolunteerEventWritesForTests } =
       await import('../src/core/context/volunteer-events.ts');
     _resetPendingVolunteerEventWritesForTests();
@@ -302,9 +303,10 @@ describe('ambient-channel event logging (codex D11 — logChannel: reflex)', () 
       engine,
       'default',
       extractCandidates('what do you think about Alice Example?'),
-      { logChannel: 'reflex' },
+      {},
     );
     expect(block).not.toBeNull();
+    logDeliveredReflexPointers(engine, block!.pointers);
     const { unfinished } = await awaitPendingVolunteerEventWrites(5_000);
     expect(unfinished).toBe(0);
     const rows = await engine.executeRaw<{ channel: string; slug: string; match_arm: string }>(
@@ -317,7 +319,7 @@ describe('ambient-channel event logging (codex D11 — logChannel: reflex)', () 
     expect(rows[0].match_arm).toBe('title');
   });
 
-  test('no logChannel → no events (the volunteer layer logs its own)', async () => {
+  test('the bare resolver logs nothing — delivery is the only logging seam', async () => {
     await engine.executeRaw('DELETE FROM context_volunteer_events').catch(() => {});
     await seed('people/alice-example', 'Alice Example', 'A founder.');
     const block = await resolveEntitiesToPointers(
@@ -328,6 +330,16 @@ describe('ambient-channel event logging (codex D11 — logChannel: reflex)', () 
     );
     expect(block).not.toBeNull();
     const { awaitPendingVolunteerEventWrites } = await import('../src/core/context/volunteer-events.ts');
+    await awaitPendingVolunteerEventWrites(5_000);
+    const rows = await engine.executeRaw<{ channel: string }>('SELECT channel FROM context_volunteer_events', []);
+    expect(rows.length).toBe(0);
+  });
+
+  test('logDeliveredReflexPointers with an empty pointer list is a no-op', async () => {
+    const { logDeliveredReflexPointers } = await import('../src/core/context/retrieval-reflex.ts');
+    const { awaitPendingVolunteerEventWrites } = await import('../src/core/context/volunteer-events.ts');
+    await engine.executeRaw('DELETE FROM context_volunteer_events').catch(() => {});
+    logDeliveredReflexPointers(engine, []);
     await awaitPendingVolunteerEventWrites(5_000);
     const rows = await engine.executeRaw<{ channel: string }>('SELECT channel FROM context_volunteer_events', []);
     expect(rows.length).toBe(0);
@@ -350,15 +362,19 @@ describe('serve IPC wiring — suppression passthrough + reflex-channel logging 
 
     const dir = mkdtempSync(join(tmpdir(), 'rr-ipc-'));
     const sock = resolveSocketPath(dir);
-    // The SAME handler shape src/mcp/server.ts wires for serve: forwards
-    // suppression from the request and logs on the ambient reflex channel.
-    const server = await startResolveIpcServer(sock, (req) =>
-      resolveEntitiesToPointers(engine, req.sourceId || 'default', req.candidates ?? [], {
-        priorContextText: req.priorContextText,
-        maxPointers: req.maxPointers,
-        suppression: req.suppression,
-        logChannel: 'reflex',
-      }),
+    // The SAME wiring shape src/mcp/server.ts uses for serve: forwards
+    // suppression from the request; logging happens at DELIVERY via the
+    // onDelivered hook (post-write), never inside the resolver.
+    const { logDeliveredReflexPointers } = await import('../src/core/context/retrieval-reflex.ts');
+    const server = await startResolveIpcServer(
+      sock,
+      (req) =>
+        resolveEntitiesToPointers(engine, req.sourceId || 'default', req.candidates ?? [], {
+          priorContextText: req.priorContextText,
+          maxPointers: req.maxPointers,
+          suppression: req.suppression,
+        }),
+      (block) => logDeliveredReflexPointers(engine, block.pointers),
     );
     expect(server).not.toBeNull();
     try {

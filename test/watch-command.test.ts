@@ -154,6 +154,52 @@ describe('gbrain watch — window + cap flags (ship coverage G4)', () => {
   });
 });
 
+describe('gbrain watch — red-team hardening', () => {
+  test('starvation guard: an already-pushed slug never burns the --max-pages cap slot', async () => {
+    await seed('people/alice-example', 'Alice Example', 'Founder.');
+    await seed('people/bob-sample', 'Bob Sample', 'Engineer.');
+    const out = await watchRun(
+      [
+        'user: ping Alice Example about the round',
+        'user: also intro Alice Example to Bob Sample',
+      ],
+      ['--max-pages', '1', '--json'],
+    );
+    // Turn 1: Alice takes the single cap slot. Turn 2: Alice is excluded
+    // BEFORE the cap (not filtered after), so Bob gets the slot instead of
+    // the turn volunteering nothing forever.
+    expect(out.length).toBe(2);
+    expect(JSON.parse(out[0]).slug).toBe('people/alice-example');
+    expect(JSON.parse(out[1]).slug).toBe('people/bob-sample');
+  });
+
+  test('--window-turns clamps: 0 and negatives behave as window 1', async () => {
+    await seed('people/alice-example', 'Alice Example', 'Founder.');
+    const out = await watchRun(
+      [
+        'assistant: Alice Example led one last year.',
+        'user: what did she invest in?',
+      ],
+      ['--window-turns', '0', '--json'],
+    );
+    // Clamped to 1: fires on the mention turn only — identical to the
+    // --window-turns 1 contract above, not a crash or an unbounded window.
+    expect(out.length).toBe(1);
+    expect(JSON.parse(out[0]).turn).toBe(1);
+  });
+
+  test('--window-turns absurdly large still runs (hard cap, no unbounded re-scan)', async () => {
+    await seed('people/alice-example', 'Alice Example', 'Founder.');
+    const filler = Array.from({ length: 70 }, (_, i) => `user: filler line ${i}`);
+    const out = await watchRun(
+      [...filler, 'user: ping Alice Example'],
+      ['--window-turns', '999999', '--json'],
+    );
+    expect(out.length).toBe(1);
+    expect(JSON.parse(out[0]).slug).toBe('people/alice-example');
+  });
+});
+
 describe('gbrain watch — per-turn fail-open (review hardening)', () => {
   test('a transient DB error on one turn never kills the stream', async () => {
     await seed('people/alice-example', 'Alice Example', 'Alice is a founder.');

@@ -17,8 +17,16 @@
  * drain path instead of killing mid-write.
  *
  * Session dedupe: a slug is volunteered at most once per watch session —
- * implemented by feeding already-pushed slugs back as priorContext, so the
- * core's slug-only suppression (codex D7) does the work.
+ * already-pushed slugs ride VolunteerOpts.excludeSlugs, skipped inside the
+ * core's pointer loop BEFORE the confidence gate and maxPages cap (O(1)
+ * membership; a post-call filter would let a recurring entity starve new
+ * pages out of the cap — red-team finding).
+ *
+ * PGLite note: watch holds the single-writer engine for the whole session,
+ * so on the default engine it cannot run concurrently with `gbrain serve`
+ * (or any other gbrain process) against the same brain — run it against
+ * Postgres, or stop serve first. Routing watch through the serve resolve-IPC
+ * socket (like the ambient reflex) is a filed follow-up.
  */
 
 import { createInterface } from 'node:readline';
@@ -45,6 +53,10 @@ per session. Piped input exits at EOF; interactive sessions exit on Ctrl-C.
 Usage:
   some-transcript-feed | gbrain watch [--json]
   gbrain watch                          # interactive: type turns, Ctrl-C to end
+
+PGLite brains: watch holds the single-writer engine for the whole session —
+it cannot run alongside \`gbrain serve\` (or other gbrain processes) against
+the same brain. Use a Postgres brain for concurrent access.
 
 Flags:
   --json                 JSONL output (one volunteered page per line)
@@ -83,9 +95,12 @@ export async function runWatch(engine: BrainEngine, args: string[], deps: WatchI
   const json = args.includes('--json');
   // --window-turns wins; otherwise the same config knob the ambient reflex
   // honors (retrieval_reflex_window_turns, default 4) applies here too.
-  const windowTurns = Math.max(
-    1,
-    Math.floor(numFlag(args, '--window-turns') ?? windowTurnCount(loadConfig())),
+  // Hard cap 64: an unbounded window re-scans every retained turn on every
+  // turn over an hours-long session — the cost class the priorContext fix
+  // removed, reintroduced via a config typo (red-team finding).
+  const windowTurns = Math.min(
+    64,
+    Math.max(1, Math.floor(numFlag(args, '--window-turns') ?? windowTurnCount(loadConfig()))),
   );
   const maxPages = numFlag(args, '--max-pages');
   const minConfidence = numFlag(args, '--min-confidence');
@@ -143,15 +158,13 @@ export async function runWatch(engine: BrainEngine, args: string[], deps: WatchI
           sourceIds,
           maxPages,
           minConfidence,
+          // Session dedupe: skipped inside the core BEFORE the gate + cap
+          // (O(1) per pointer) so a recurring slug can't starve new pages.
+          excludeSlugs: pushedSlugs,
         });
       } catch {
         continue; // fail-open per turn: a transient DB error never kills the stream
       }
-      // Session dedupe via O(1) Set membership — a slug is volunteered at most
-      // once per session. (Feeding pushed slugs back as priorContext would
-      // rebuild + rescan a monotonically growing string every turn: O(T²)
-      // over a long-lived session.)
-      pages = pages.filter((p) => !pushedSlugs.has(p.slug));
       if (!pages.length) continue;
 
       for (const p of pages) pushedSlugs.add(p.slug);

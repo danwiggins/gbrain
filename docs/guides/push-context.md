@@ -45,6 +45,14 @@ volunteered_at` — the 5-minute last-retrieved throttle causes false negatives
 and unrelated reads of the same page cause false positives. Use the per-arm
 precision to tune `min_confidence`, not as an exact metric.
 
+**PGLite + `gbrain watch`:** PGLite is single-connection, and watch holds its
+connection for the whole session — a concurrent `gbrain serve` or any write
+path blocks until watch exits. On a PGLite brain, run watch in bursts (piped
+input exits at EOF) or use the ambient reflex channel instead, which routes
+through a running serve's resolve socket rather than taking the lock. Routing
+watch through that same socket is a filed follow-up (TODOS.md). Postgres
+brains are unaffected.
+
 ## Config
 
 | Key | Default | What it does |

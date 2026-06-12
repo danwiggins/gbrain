@@ -140,6 +140,21 @@ describe('volunteerContext', () => {
     expect(pages[0].rationale).toContain('assistant-introduced');
   });
 
+  test('excludeSlugs skips BEFORE the cap: an excluded entity never starves a fresh page', async () => {
+    await seed('people/alice-example', 'Alice Example', 'Founder.');
+    await seed('people/bob-sample', 'Bob Sample', 'Engineer.');
+    const turns = parseWindow('user: intro Alice Example to Bob Sample');
+    const pages = await volunteerContext(engine, turns, {
+      sourceIds: ['default'],
+      maxPages: 1,
+      excludeSlugs: new Set(['people/alice-example']),
+    });
+    // A post-call filter would return [] here (Alice burns the single cap
+    // slot, then gets filtered). The pre-cap exclusion hands Bob the slot.
+    expect(pages.length).toBe(1);
+    expect(pages[0].slug).toBe('people/bob-sample');
+  });
+
   test('confidence gate drops slug-suffix matches at the default threshold', async () => {
     // Page resolvable ONLY via slug-suffix: title differs from the mention.
     await seed('projects/widget-co', 'The Widget Company Project', 'A project page.');
