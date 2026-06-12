@@ -16,11 +16,11 @@
  *           ▼  (per call site, in its finally — nine sites in cli.ts)
  *   finishCliTeardown({ engine, drainTimeoutMs? })   ← teardown ONLY, never exits*
  *           │
- *           ├─ arm unref'd backstop timer; deadline COMPUTED from the bounds
+ *           ├─ arm ref'd backstop timer; deadline COMPUTED from the bounds
  *           │  it guards (sinks × drainTimeoutMs + facts-abort grace
  *           │  + 2 × pool-end bound + slack, floor 10s). The backstop fires
  *           │  ONLY if a component violated its own bound; on fire it prints
- *           │  a truthful banner and *flushThenExit(process.exitCode ?? 0).
+ *           │  a truthful banner and *flushThenExit(currentExitCode()).
  *           │  GBRAIN_TEARDOWN_DEADLINE_MS overrides (incident escape hatch).
  *           ▼
  *     drain background sinks (bounded per-sink; CLI-exit-only contract)
