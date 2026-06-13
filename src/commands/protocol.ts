@@ -30,6 +30,7 @@ import { buildToolDefs } from '../mcp/tool-defs.ts';
 import { runConformance, type ConformanceClient } from '../core/verbs/conformance.ts';
 import { readVerbUsage, earliestVerbUsageTs, usageLogPath } from '../core/verbs/usage-log.ts';
 import { loadConfig } from '../core/config.ts';
+import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 
 const HELP = `gbrain protocol — the MEMORY_VERBS v1 wire contract (frozen, additive-forever)
 
@@ -77,7 +78,9 @@ export async function runProtocol(args: string[]): Promise<void> {
   }
   console.error(`Unknown protocol subcommand: ${sub}`);
   console.log(HELP);
-  process.exitCode = 1;
+  // [ship P1.3] PGLite/WASM clobbers process.exitCode; the CLI exit seam reads
+  // the gbrain-owned verdict (setCliExitVerdict), not process.exitCode.
+  setCliExitVerdict(1);
 }
 
 // ─── protocol [--json] ───────────────────────────────────────────────────────
@@ -204,7 +207,10 @@ async function runConformanceCommand(args: string[]): Promise<void> {
       console.log(`\n${report.passed} passed, ${report.failed} failed, ${report.skipped} skipped`);
       console.log(report.ok ? 'CONFORMANT' : 'NOT CONFORMANT');
     }
-    if (!report.ok) process.exitCode = 1;
+    // [ship P1.3] non-conformant target MUST exit non-zero so CI fails. The
+    // CLI exit seam reads setCliExitVerdict (process.exitCode is unreliable on
+    // PGLite/WASM and ignored by the force-exit path).
+    if (!report.ok) setCliExitVerdict(1);
   } finally {
     try { await client.close(); } catch { /* best-effort */ }
     try { await transport.close(); } catch { /* best-effort */ }

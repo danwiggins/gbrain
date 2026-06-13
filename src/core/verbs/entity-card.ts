@@ -204,7 +204,16 @@ async function assembleCard(
 
   // Parallel depth-1 reads — every arm individually fail-soft so a partial
   // brain (no aliases, no timeline) still returns a card.
-  const [aka, outLinks, inLinks, backlinkCounts, timeline, facts] = await Promise.all([
+  //
+  // [ship P1.2] Incoming edges + backlink_count are SOURCE-SAFE on BOTH sides.
+  // engine.getBacklinks(slug,{sourceId}) only scopes the TARGET page's source,
+  // so a foreign-source page linking to a same-named entity would leak its
+  // slug; engine.getBacklinkCounts has no source param at all. We instead run
+  // a both-sides-scoped query here (f.source_id = t.source_id = this source),
+  // mentions excluded (matching the backlink-count convention). Outgoing edges
+  // (getLinks) are the entity's OWN declared links — from-side scoped — so they
+  // stay as-is.
+  const [aka, outLinks, inEdges, backlinkCount, timeline, facts] = await Promise.all([
     engine
       .executeRaw<{ alias_norm: string }>(
         `SELECT alias_norm FROM page_aliases WHERE source_id = $1 AND slug = $2 ORDER BY alias_norm`,
@@ -213,8 +222,29 @@ async function assembleCard(
       .then(rs => rs.map(r => r.alias_norm))
       .catch(() => [] as string[]),
     engine.getLinks(pageSlug, { sourceId }).catch(() => []),
-    engine.getBacklinks(pageSlug, { sourceId }).catch(() => []),
-    engine.getBacklinkCounts([pageSlug]).catch(() => new Map<string, number>()),
+    engine
+      .executeRaw<{ from_slug: string; link_type: string; context: string | null }>(
+        `SELECT f.slug AS from_slug, l.link_type, l.context
+           FROM links l
+           JOIN pages f ON f.id = l.from_page_id
+           JOIN pages t ON t.id = l.to_page_id
+          WHERE t.slug = $1 AND t.source_id = $2 AND f.source_id = $2
+            AND COALESCE(l.link_source, '') <> 'mentions'`,
+        [pageSlug, sourceId],
+      )
+      .catch(() => [] as Array<{ from_slug: string; link_type: string; context: string | null }>),
+    engine
+      .executeRaw<{ n: string | number }>(
+        `SELECT COUNT(*) AS n
+           FROM links l
+           JOIN pages f ON f.id = l.from_page_id
+           JOIN pages t ON t.id = l.to_page_id
+          WHERE t.slug = $1 AND t.source_id = $2 AND f.source_id = $2
+            AND COALESCE(l.link_source, '') <> 'mentions'`,
+        [pageSlug, sourceId],
+      )
+      .then(rs => Number(rs[0]?.n ?? 0))
+      .catch(() => 0),
     engine.getTimeline(pageSlug, { limit: 5, sourceId }).catch(() => []),
     engine
       .listFactsByEntity(sourceId, pageSlug, {
@@ -232,8 +262,7 @@ async function assembleCard(
     if (edges.length >= EDGE_CAP) break;
   }
   if (edges.length < EDGE_CAP) {
-    for (const l of inLinks) {
-      if (l.link_source === 'mentions') continue;
+    for (const l of inEdges) {
       edges.push({ type: l.link_type, direction: 'in', slug: l.from_slug, context: l.context || null });
       if (edges.length >= EDGE_CAP) break;
     }
@@ -268,7 +297,7 @@ async function assembleCard(
     },
     open_threads: openThreads,
     edges,
-    backlink_count: backlinkCounts.get(pageSlug) ?? 0,
+    backlink_count: backlinkCount,
     active_fact_count: facts.length,
   };
 }

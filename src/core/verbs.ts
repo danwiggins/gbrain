@@ -319,8 +319,13 @@ const forget: Operation = {
     }
 
     const { forgetFactInFence } = await import('./facts/forget.ts');
+    // [ship P1.1] trust boundary: scope the forget to the caller's source, and
+    // for remote callers to world-visible facts only — a guessed global id
+    // can't expire facts outside the caller's source or reach private facts.
     const result = await forgetFactInFence(ctx.engine, numericId, {
       ...(reason ? { reason } : {}),
+      sourceId: ctx.sourceId ?? 'default',
+      worldOnly: ctx.remote !== false,
     });
 
     if (!result.ok && result.path === 'not_found') {

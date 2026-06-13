@@ -241,6 +241,38 @@ describe('entity — card, arms, zero LLM', () => {
     expect(violations).toEqual([]);
   });
 
+  it('[ship P1.2] entity card backlinks are source-isolated on BOTH sides (no foreign from_slug leak)', async () => {
+    // Same slug exists in two sources; a foreign-source page links to the
+    // default-source entity. The card must NOT surface the foreign edge/count.
+    await seedEntityPage('people/iso-target', 'Iso Target');
+    // Register the foreign tenant source (FK target) + a foreign page that
+    // links INTO the default-source entity.
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ('other', 'other-tenant', '{}'::jsonb)
+       ON CONFLICT (id) DO NOTHING`,
+      [],
+    );
+    await engine.executeRaw(
+      `INSERT INTO pages (slug, type, title, compiled_truth, frontmatter, source_id, created_at, updated_at)
+       VALUES ('people/foreign-linker', 'person', 'Foreign Linker', '# Foreign', '{}', 'other', NOW(), NOW())`,
+      [],
+    );
+    await engine.executeRaw(
+      `INSERT INTO links (from_page_id, to_page_id, link_type, link_source)
+       SELECT f.id, t.id, 'works_at', 'markdown'
+         FROM pages f, pages t
+        WHERE f.slug = 'people/foreign-linker' AND f.source_id = 'other'
+          AND t.slug = 'people/iso-target' AND t.source_id = 'default'`,
+      [],
+    );
+    const { body } = await callRemote('entity', { name: 'people/iso-target' });
+    expect(body.found).toBe(true);
+    // The foreign cross-source backlink must not appear in edges OR the count.
+    const edgeSlugs = (body.card.edges as Array<{ slug: string }>).map(e => e.slug);
+    expect(edgeSlugs).not.toContain('people/foreign-linker');
+    expect(body.card.backlink_count).toBe(0);
+  });
+
   it('remote card never carries private commitment facts (fence test)', async () => {
     await seedEntityPage('people/fence-test', 'Fence Test Person');
     await callRemote('remember', {
@@ -310,6 +342,60 @@ describe('forget — idempotency + not_found', () => {
     expect(missing.isError).toBe(true);
     expect(missing.body.error).toBe('not_found');
     expect(missing.body.suggestion.length).toBeGreaterThan(0);
+  });
+
+  it('[ship P1.1] a remote caller in source A cannot forget a fact in source B (returns not_found, not expired)', async () => {
+    // Register the 'other' tenant source (FK target) then seed a fact in it.
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ('other', 'other-tenant', '{}'::jsonb)
+       ON CONFLICT (id) DO NOTHING`,
+      [],
+    );
+    await engine.insertFact(
+      { fact: 'cross-source secret fact', kind: 'fact', entity_slug: null, visibility: 'world', source: 'seed' },
+      { source_id: 'other' },
+    );
+    const otherRows = await engine.executeRaw<{ id: number }>(
+      `SELECT id FROM facts WHERE source_id = 'other' AND fact = 'cross-source secret fact' LIMIT 1`,
+      [],
+    );
+    const foreignId = String(otherRows[0].id);
+
+    // Remote caller scoped to 'default' tries to forget the 'other'-source id.
+    const res = await dispatchToolCall(engine, 'forget', { id: foreignId }, {
+      remote: true, takesHoldersAllowList: ['world'], sourceId: 'default',
+    });
+    const body = JSON.parse(res.content[0].text);
+    expect(res.isError).toBe(true);
+    expect(body.error).toBe('not_found'); // no cross-source existence leak
+
+    // And the foreign fact is STILL active (not expired by the cross-source call).
+    const stillActive = await engine.executeRaw<{ expired_at: Date | null }>(
+      `SELECT expired_at FROM facts WHERE id = $1`,
+      [otherRows[0].id],
+    );
+    expect(stillActive[0].expired_at).toBe(null);
+  });
+
+  it('[ship P1.1] a remote caller cannot forget a private fact (world-only)', async () => {
+    const r = await callRemote('remember', {
+      fact: 'private fact remote cannot forget', provenance: 'test',
+      entity: 'people/private-forget-test', visibility: 'private',
+    });
+    // remote remember defaults world; force a private one locally instead.
+    const localRes = await dispatchToolCall(engine, 'remember', {
+      fact: 'truly private fact', provenance: 'test',
+      entity: 'people/private-forget-test', visibility: 'private',
+    }, { remote: false, sourceId: 'default' });
+    const localId = JSON.parse(localRes.content[0].text).id as string;
+
+    const res = await dispatchToolCall(engine, 'forget', { id: localId }, {
+      remote: true, takesHoldersAllowList: ['world'], sourceId: 'default',
+    });
+    const body = JSON.parse(res.content[0].text);
+    expect(res.isError).toBe(true);
+    expect(body.error).toBe('not_found'); // remote can't reach a private fact
+    void r;
   });
 });
 
