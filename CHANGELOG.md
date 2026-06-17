@@ -22,6 +22,23 @@ Nothing here forks the manifest, the installer, or the trust model — brain pac
 
 ### To take advantage of v0.42.47.0
 `gbrain upgrade`, then run `gbrain advisor` to see the top things worth doing on your brain right now. To publish a brain's skills to anyone who connects, run `gbrain skillpack init-brain-pack <name>` in the brain repo, fill in the README's five sections, and commit it. To let connecting agents discover packs over MCP, `gbrain config set mcp.publish_skills true`; to let a thin client run the advisor, `gbrain config set mcp.publish_advisor true` (both default off). Install the `gbrain-advisor` skill and its weekly cron recipe for a standing brain checkup.
+## [0.42.46.0] - 2026-06-16
+
+**Federated read scope now reaches every by-slug read, not just search and query (gbrain#2200).** A client that mounts several sources (a `federated_read` grant) could find a page through search and query, but the by-slug reads — `get_page`'s tags, plus `get_tags`, `get_links`, `get_backlinks`, and `get_timeline` — didn't honor the same grant. For a page living outside the default source that meant two wrong outcomes: the read came back empty for content the client was authorized to see, or it resolved against the wrong source. This release routes all of those reads through the same source-scope ladder that already governs search/query, so a federated client reads exactly the sources it's granted — no more, no less. Thanks to @mlobo2012 for the report and the proposed fix.
+
+Link reads are scoped on every endpoint. A link connects up to three pages (the source page, the target, and the page that authored the edge); a federated read now constrains all three to the grant, so a link that crosses out of your granted sources doesn't surface a foreign page's slug. Untrusted remote callers carrying a single-source token get the same all-endpoint scoping; trusted local CLI keeps its cross-source view for link reconciliation and validators.
+
+The semantic query cache was already corrected in v0.42.34.0 (cache rows key on the full source set, so a federated result can't be served to a caller with a different scope); this release closes the read-path half of the same theme.
+
+### Fixed
+- **By-slug reads honor the federated read grant.** `get_page` resolves a page's tags against that page's own source, and `get_tags` / `get_links` / `get_backlinks` / `get_timeline` route through the federated source scope. A multi-source client reads tags, links, backlinks, and timeline across exactly its granted sources (union), instead of falling back to a single source.
+- **Link reads are scoped on all three endpoints** (source, target, and authoring page) under a federated grant, and untrusted remote single-source callers are scoped the same way — so a cross-source link can't disclose a foreign slug. Trusted local reads keep the full cross-source view.
+
+### Changed
+- The engine's `getTags` / `getLinks` / `getBacklinks` / `getTimeline` and `TimelineOpts` accept a `sourceIds[]` federated scope (precedence over the scalar source), mirroring `getPage` from v0.42.37.0. Write-side operations are unchanged — a read grant never widens writes.
+
+### To take advantage of v0.42.46.0
+`gbrain upgrade`. No configuration needed — federated clients immediately read tags, links, backlinks, and timeline across their full granted source set, and cross-source link reads stop surfacing foreign slugs. Single-source brains are unaffected.
 
 ## [0.42.45.0] - 2026-06-13
 
