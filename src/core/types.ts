@@ -761,6 +761,8 @@ export interface SearchResult {
   salience_boost?: number;
   /** Multiplier applied by applyRecencyBoost. */
   recency_boost?: number;
+  /** v0.42.x (#2390) — multiplier applied by applyChronicleTypeBoost (event/diary on temporal queries). */
+  chronicle_boost?: number;
   /** Multiplier applied by applyExactMatchBoost. */
   exact_match_boost?: number;
   /** Multiplier applied by applyGraphSignals (adjacency hit). */
