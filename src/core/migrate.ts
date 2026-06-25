@@ -862,7 +862,7 @@ export const MIGRATIONS: Migration[] = [
       DECLARE
         has_bypass BOOLEAN;
       BEGIN
-        SELECT EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
+        SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
         IF NOT has_bypass THEN
           -- Fail the migration loudly instead of WARNING + version-bump.
           -- The runner unconditionally records schema_version on success,
@@ -1151,7 +1151,7 @@ export const MIGRATIONS: Migration[] = [
         DECLARE
           has_bypass BOOLEAN;
         BEGIN
-          SELECT EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
+          SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
           IF NOT has_bypass THEN
             RAISE EXCEPTION 'v29 cathedral_ii_code_edges_rls: role % does not have BYPASSRLS privilege — cannot enable RLS safely. Re-run as postgres (or another BYPASSRLS role). The migration will retry automatically on the next initSchema call.', current_user;
           END IF;
@@ -1239,7 +1239,7 @@ export const MIGRATIONS: Migration[] = [
       DECLARE
         has_bypass BOOLEAN;
       BEGIN
-        SELECT EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
+        SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
         IF has_bypass THEN
           ALTER TABLE takes              ENABLE ROW LEVEL SECURITY;
           ALTER TABLE synthesis_evidence ENABLE ROW LEVEL SECURITY;
@@ -1341,7 +1341,7 @@ export const MIGRATIONS: Migration[] = [
       DECLARE
         has_bypass BOOLEAN;
       BEGIN
-        SELECT EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
+        SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
         IF has_bypass THEN
           ALTER TABLE dream_verdicts ENABLE ROW LEVEL SECURITY;
         END IF;
@@ -1380,7 +1380,7 @@ export const MIGRATIONS: Migration[] = [
         DECLARE
           has_bypass BOOLEAN;
         BEGIN
-          SELECT EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
+          SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
           IF NOT has_bypass THEN
             RAISE EXCEPTION 'v31 eval_capture_tables: role % does not have BYPASSRLS privilege — cannot enable RLS safely. Re-run as postgres (or another BYPASSRLS role). The migration will retry automatically on the next initSchema call.', current_user;
           END IF;
@@ -1499,7 +1499,7 @@ export const MIGRATIONS: Migration[] = [
       DECLARE
         has_bypass BOOLEAN;
       BEGIN
-        SELECT EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
+        SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
         IF has_bypass THEN
           ALTER TABLE oauth_clients ENABLE ROW LEVEL SECURITY;
           ALTER TABLE oauth_tokens ENABLE ROW LEVEL SECURITY;
@@ -1720,7 +1720,7 @@ export const MIGRATIONS: Migration[] = [
           has_bypass BOOLEAN;
           r record;
         BEGIN
-          SELECT EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
+          SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
           IF NOT has_bypass THEN
             -- Same posture as v24: raise to abort the migration so the runner
             -- leaves config.version unbumped and retries on the next call.
@@ -2112,7 +2112,7 @@ export const MIGRATIONS: Migration[] = [
       DECLARE
         has_bypass BOOLEAN;
       BEGIN
-        SELECT EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
+        SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
         IF has_bypass THEN
           ALTER TABLE drift_decisions ENABLE ROW LEVEL SECURITY;
         END IF;
@@ -2365,7 +2365,7 @@ export const MIGRATIONS: Migration[] = [
           DECLARE
             has_bypass BOOLEAN;
           BEGIN
-            SELECT EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
+            SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
             IF has_bypass THEN
               ALTER TABLE facts ENABLE ROW LEVEL SECURITY;
             END IF;
@@ -4389,7 +4389,7 @@ export const MIGRATIONS: Migration[] = [
       DECLARE
         has_bypass BOOLEAN;
       BEGIN
-        SELECT EXISTS (SELECT 1 FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'USAGE') AND (r.rolbypassrls OR r.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
+        SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass; -- #1385: superuser + inherited-role BYPASSRLS, not just the role's own rolbypassrls
         IF has_bypass THEN
           ALTER TABLE take_domain_assignments ENABLE ROW LEVEL SECURITY;
         END IF;

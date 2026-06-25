@@ -1379,7 +1379,9 @@ DO $$
 DECLARE
   has_bypass BOOLEAN;
 BEGIN
-  SELECT rolbypassrls INTO has_bypass FROM pg_roles WHERE rolname = current_user;
+  -- #1385: recognize superuser + inherited-role BYPASSRLS, not just the role's
+  -- own rolbypassrls (alias `pr` avoids any plpgsql record-variable collision).
+  SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass;
   IF has_bypass THEN
     ALTER TABLE pages ENABLE ROW LEVEL SECURITY;
     ALTER TABLE content_chunks ENABLE ROW LEVEL SECURITY;
