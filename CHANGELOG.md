@@ -2,6 +2,14 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.54.1] - 2026-07-03
+
+### Fixed
+
+- **Supabase Storage signed URLs 404'd — missing `/storage/v1` path segment.** `SupabaseStorage.getSignedUrl` built the download URL as `${projectUrl}${signedURL}`, but Supabase returns `signedURL` relative to the Storage API root (`/object/sign/<bucket>/<path>?token=…`), so the generated link dropped `/storage/v1` and returned 404. It now prepends `${projectUrl}/storage/v1`, tolerating an already-absolute URL or a value that already carries the prefix. `gbrain files signed-url` links resolve again.
+
+To take advantage of v0.42.54.1: no action needed — existing private-bucket file stores now produce working signed download URLs.
+
 ## [0.42.54.0] - 2026-06-30
 
 **Fact extraction is now durable: real-time extraction that gets dropped on process exit is recovered automatically, and the conversation backfill makes monotonic forward progress instead of re-extracting (and re-spending) the same page every cycle.** A page could land with zero facts and stay that way forever — the real-time extractor runs fire-and-forget on an in-memory queue, and when the writing process exited before that settled, the in-flight call was aborted and nothing retried it. The durable catch-up that would have rescued it only worked for chat-shaped pages, and even then it wiped the whole page at the start of every run, so a page too large for one cycle's budget could never finish.
