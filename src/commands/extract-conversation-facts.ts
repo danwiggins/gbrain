@@ -81,6 +81,8 @@ import {
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions, maybeBackground } from '../core/cli-options.ts';
 import { loadConfig } from '../core/config.ts';
+import { runLlmFallback } from '../core/conversation-parser/llm-fallback.ts';
+import { resolveModel } from '../core/model-config.ts';
 import { createHash } from 'crypto';
 // v0.41.15.0 (T5): worker-pool primitive + per-source-clamp wrapper +
 // per-page advisory lock + delete-orphans-first replay safety. See plan
@@ -257,6 +259,9 @@ export interface ExtractConversationFactsResult {
   pages_skipped: number;
   pages_skipped_too_large: number;
   pages_skipped_disappeared: number;
+  /** v0.42.x: pages whose built-in regex parse missed but the opt-in LLM
+   *  fallback recovered messages from. Absent/0 when the fallback is off. */
+  pages_llm_fallback?: number;
   /**
    * v0.41.15.0 (D6): pages we attempted to claim but skipped because
    * another worker / parallel process held the advisory lock. The pages
@@ -694,6 +699,15 @@ interface ExtractCoreState {
    * page that doesn't finish in one cycle resumes mid-page.
    */
   cpMap: Map<string, CpEntry>;
+  /**
+   * v0.42.x — LLM conversation-parser fallback. Opt-in via
+   * `conversation_parser.llm_fallback_enabled=true`. When enabled and a
+   * page's built-in regex parse returns phase `no_match`, the page body is
+   * parsed by the utility-tier LLM (see `conversation-parser/llm-fallback.ts`).
+   * Resolved ONCE at state construction: model is null when disabled.
+   */
+  llmFallbackEnabled: boolean;
+  llmFallbackModel: string | null;
 }
 
 function cpMapKey(sourceId: string, slug: string): string {
@@ -766,9 +780,42 @@ async function processPage(
   // meant Telegram-bracket pages with frontmatter dates landed at
   // 1970-01-01. Now they pick up the correct date.
   const parseResult = parseConversation(body, { page });
-  const messages = parseResult.messages;
+  let messages = parseResult.messages;
   if (parseResult.timezone_warning) {
     process.stderr.write(parseResult.timezone_warning + '\n');
+  }
+  // v0.42.x — LLM fallback wiring (previously defined but never called). When
+  // no built-in regex pattern matched (phase `no_match`) and the operator has
+  // opted in, ask the utility-tier LLM to parse the body. The prompt returns
+  // [] for non-chat content (README/code/etc.), so non-conversation pages stay
+  // skipped. Fail-open: any error leaves `messages` empty and the page skipped.
+  if (
+    messages.length === 0 &&
+    parseResult.phase === 'no_match' &&
+    state.llmFallbackEnabled &&
+    state.llmFallbackModel
+  ) {
+    try {
+      const fb = await runLlmFallback({
+        modelStr: state.llmFallbackModel,
+        body,
+        engine: state.engine,
+        signal: state.signal,
+      });
+      if (fb && fb.length > 0) {
+        messages = fb;
+        state.result.pages_llm_fallback = (state.result.pages_llm_fallback ?? 0) + 1;
+        process.stderr.write(
+          `[extract-conversation-facts] LLM-fallback parsed ${fb.length} message(s) for ${page.slug}\n`,
+        );
+      }
+    } catch (err) {
+      if (isAbortError(err)) throw err;
+      if (err instanceof BudgetExhausted) throw err;
+      process.stderr.write(
+        `[extract-conversation-facts] LLM-fallback failed for ${page.slug}: ${(err as Error).message}\n`,
+      );
+    }
   }
   const segments = splitIntoSegments(messages, { sinceIso });
   if (segments.length === 0) {
@@ -1041,6 +1088,19 @@ export async function runExtractConversationFactsCore(
   const workers = workersResolved.workers;
 
   const deadlineHit = { value: false };
+  // v0.42.x — resolve the LLM conversation-parser fallback gate ONCE.
+  // Opt-in: `gbrain config set conversation_parser.llm_fallback_enabled true --force`.
+  // Utility tier (Haiku-class) keeps the per-page cost low; the fallback is
+  // content-hash cached in llm-base so re-runs of an already-parsed page are free.
+  const llmFallbackEnabled =
+    (await engine.getConfig('conversation_parser.llm_fallback_enabled'))?.trim() === 'true';
+  const llmFallbackModel = llmFallbackEnabled
+    ? await resolveModel(engine, {
+        tier: 'utility',
+        fallback: 'anthropic:claude-haiku-4-5-20251001',
+      })
+    : null;
+
   const state: ExtractCoreState = {
     result,
     engine,
@@ -1054,6 +1114,8 @@ export async function runExtractConversationFactsCore(
     deadlineMs: opts.deadlineMs && opts.deadlineMs > 0 ? opts.deadlineMs : 0,
     deadlineHit,
     cpMap: new Map(),
+    llmFallbackEnabled,
+    llmFallbackModel,
   };
 
   // Run body. Either inside the externally-provided tracker scope (no
