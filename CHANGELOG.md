@@ -2,6 +2,12 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.57.2] - 2026-07-08
+
+### Fixed
+
+- **Chronicle 119→122 upgrade wedge (cherry-picked upstream PR #2623).** v0.42.56 shipped an existing-Postgres-brain upgrade deadlock: `schema.sql` eager-creates `idx_timeline_event_page`/`idx_timeline_event_dedup` on `timeline_entries.event_page_id` during schema-blob replay, before migration v121 adds that column, so `gbrain init --migrate-only` dies with `column "event_page_id" does not exist` (upstream #2667/#2626/#2645/#2671). The forward-reference bootstrap in both engines now adds `event_page_id` before the blob replay. Validated on this fork: typecheck clean, bootstrap tests 16/16 pass incl. the dedicated pre-v121 `timeline_entries` reproduction. The facts ontology columns (v122) are self-contained in their migration and do not wedge.
+
 ## [0.42.57.1] - 2026-07-08
 
 ### Changed
