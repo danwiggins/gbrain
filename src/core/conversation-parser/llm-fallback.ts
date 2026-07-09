@@ -59,6 +59,15 @@ export interface RunLlmFallbackOpts {
   engine?: BrainEngine;
   /** Test seam. */
   chatTransport?: ChatTransport;
+  /**
+   * v0.42.x — conversation date (YYYY-MM-DD) for the page, from the caller's
+   * date-context derivation. Injected into the prompt so the model stamps
+   * time-only timestamps with the real date instead of the 1970-01-01 epoch
+   * default. Critical for the backfill cycle: 1970 timestamps fall below the
+   * per-page segment/checkpoint watermark, so the page never advances and is
+   * re-parsed every cycle. Omitted / '1970-01-01' → prior epoch behavior.
+   */
+  fallbackDate?: string;
 }
 
 /**
@@ -77,10 +86,19 @@ export async function runLlmFallback(
     .slice(0, sampleN)
     .join('\n');
 
+  // Prepend the known conversation date so the model resolves time-only
+  // timestamps to it (not 1970-01-01). Kept in `content` (not `system`) so it
+  // participates in the content-hash cache key — two pages with the same body
+  // but different dates must not share a cached parse.
+  const dateHeader =
+    opts.fallbackDate && opts.fallbackDate !== '1970-01-01'
+      ? `[Conversation date: ${opts.fallbackDate}. Use this date for any time-only timestamps.]\n`
+      : '';
+
   return runLlmCall<MatchedMessage[]>({
     shape: 'fallback',
     modelStr: opts.modelStr,
-    content: sampled,
+    content: dateHeader + sampled,
     system: FALLBACK_SYSTEM_PROMPT,
     signal: opts.signal,
     engine: opts.engine,

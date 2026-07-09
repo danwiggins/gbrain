@@ -302,6 +302,7 @@ export interface ExtractConversationFactsResult {
 
 import {
   parseConversation,
+  deriveDateContext,
   type ParseConversationOpts as OrchestratorParseOpts,
 } from '../core/conversation-parser/parse.ts';
 
@@ -801,6 +802,11 @@ async function processPage(
         body,
         engine: state.engine,
         signal: state.signal,
+        // Thread the page's date so time-only timestamps resolve to the real
+        // conversation date, not 1970-01-01. Without this the fallback's
+        // messages fall below the per-page segment/checkpoint watermark, so
+        // the backfill cycle never advances and re-parses the page forever.
+        fallbackDate: deriveDateContext({ page }).fallbackDate,
       });
       if (fb && fb.length > 0) {
         messages = fb;
