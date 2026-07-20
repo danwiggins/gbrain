@@ -2,6 +2,24 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.58.2] - 2026-07-20
+
+**Structured meeting summaries now produce grounded facts instead of being mistaken for failed chat parses. Slack machine-noise pages keep the strict non-extractable path.**
+
+### Why
+
+The first production canary for 0.42.58.1 stayed under its $0.25 ceiling but exposed a quality gap: Fireflies meeting pages contain rich `Overview`, `Action items`, and decision sections rather than speaker/timestamp chat lines. The conversation parser correctly returned no messages, but that left useful meeting knowledge without fact rows.
+
+### What changed
+
+- Rich `meeting` pages with structured summary headings are split into bounded 5,600-character extraction units and sent through the existing fact extractor with an explicit long-form meeting header.
+- Slack remains on the chat parser and scanned-not-extractable path, so heartbeat/watchdog channels do not create facts.
+- Long-form segment timestamps derive from `page.updated_at`; a changed meeting summary clears its old CLI checkpoint/facts and replaces them instead of appending duplicates.
+- CLI output reports how many pages used long-form meeting extraction.
+- Unit and engine-wired tests cover chunk bounds, Slack exclusion, explicit labeling, fact insertion, and update-time replacement.
+
+No database migration is required. Repeat the same bounded canary after upgrading; advance only when sampled facts are grounded and retrieval improves.
+
 ## [0.42.58.1] - 2026-07-20
 
 **Conversation backfills now stop revisiting finished pages, keep harmless parser misses separate from real extraction work, and default to the Slack and meeting material most likely to improve retrieval. Custom schema packs also receive the types they inherit from their parent packs, so doctor evaluates the schema users actually configured.**

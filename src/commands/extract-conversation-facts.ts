@@ -127,6 +127,14 @@ export const DEFAULT_INTER_CALL_SLEEP_MS = 200;
 export const SEGMENT_TEXT_CHAR_LIMIT = 6500;
 
 /**
+ * Long-form Fireflies/meeting summaries are knowledge-rich but are not chat
+ * logs. Keep each direct-extraction unit below the normal segment cap so the
+ * shared fact extractor still receives its topical header in full.
+ */
+export const LONG_FORM_MEETING_CHUNK_CHARS = 5600;
+export const LONG_FORM_MEETING_MIN_CHARS = 400;
+
+/**
  * Hard cap on per-page body bytes (compiled_truth + timeline). Pages
  * exceeding the cap are skipped to bound worker memory (Eng A2). A
  * streaming/per-segment-fetch path for 50MB+ iMessage histories is a
@@ -203,6 +211,7 @@ export interface ConversationSegment {
   startIso: string;
   endIso: string;
   participants: string[];
+  format?: 'conversation' | 'long_form_meeting';
 }
 
 /**
@@ -286,6 +295,8 @@ export interface ExtractConversationFactsResult {
   /** v0.42.x: pages whose built-in regex parse missed but the opt-in LLM
    *  fallback recovered messages from. Absent/0 when the fallback is off. */
   pages_llm_fallback?: number;
+  /** Rich structured meeting summaries routed directly to fact extraction. */
+  pages_long_form_meeting?: number;
   /**
    * v0.41.15.0 (D6): pages we attempted to claim but skipped because
    * another worker / parallel process held the advisory lock. The pages
@@ -414,6 +425,62 @@ export function splitIntoSegments(
   return out;
 }
 
+/**
+ * Split a structured meeting summary into bounded extraction units without
+ * pretending it is a chat log. Timestamps derive from page.updated_at so a
+ * changed summary sorts after its prior checkpoint and is fully refreshed.
+ * Slack remains on the chat/noise-classification path.
+ */
+export function splitLongFormMeeting(
+  page: Page,
+  body: string,
+  opts: { sinceIso?: string } = {},
+): ConversationSegment[] {
+  const normalized = body.trim();
+  if (page.type !== 'meeting' || normalized.length < LONG_FORM_MEETING_MIN_CHARS) {
+    return [];
+  }
+  if (!/^##\s+(overview|summary|action items?|key (?:points|decisions|takeaways)|discussion)/im.test(normalized)) {
+    return [];
+  }
+
+  const blocks = normalized.split(/\n{2,}/).map((block) => block.trim()).filter(Boolean);
+  const chunks: string[] = [];
+  let current = '';
+  const flush = () => {
+    if (current.trim()) chunks.push(current.trim());
+    current = '';
+  };
+  for (const block of blocks) {
+    if (block.length > LONG_FORM_MEETING_CHUNK_CHARS) {
+      flush();
+      for (let start = 0; start < block.length; start += LONG_FORM_MEETING_CHUNK_CHARS) {
+        chunks.push(block.slice(start, start + LONG_FORM_MEETING_CHUNK_CHARS));
+      }
+      continue;
+    }
+    const candidate = current ? `${current}\n\n${block}` : block;
+    if (candidate.length > LONG_FORM_MEETING_CHUNK_CHARS) flush();
+    current = current ? `${current}\n\n${block}` : block;
+  }
+  flush();
+
+  const updatedMs = new Date(page.updated_at).getTime();
+  if (!Number.isFinite(updatedMs)) return [];
+  const sinceMs = opts.sinceIso ? Date.parse(opts.sinceIso) : NaN;
+  return chunks.flatMap((text, index) => {
+    const timestamp = new Date(updatedMs + index * 1000).toISOString();
+    if (Number.isFinite(sinceMs) && Date.parse(timestamp) <= sinceMs) return [];
+    return [{
+      messages: [{ speaker: 'Meeting notes', timestamp, text }],
+      startIso: timestamp,
+      endIso: timestamp,
+      participants: ['Meeting notes'],
+      format: 'long_form_meeting' as const,
+    }];
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Segment rendering with topical/temporal header.
 // ---------------------------------------------------------------------------
@@ -422,9 +489,12 @@ export function renderSegmentForExtraction(
   pageTitle: string,
   segment: ConversationSegment,
 ): string {
+  const context = segment.format === 'long_form_meeting'
+    ? `Long-form meeting notes updated ${segment.startIso}`
+    : `Conversation between ${segment.participants.join(' and ')} from ${segment.startIso} to ${segment.endIso}`;
   const header = [
     `Page: ${pageTitle}`,
-    `Conversation between ${segment.participants.join(' and ')} from ${segment.startIso} to ${segment.endIso}`,
+    context,
     '---',
   ].join('\n');
   const body = segment.messages
@@ -557,6 +627,19 @@ function readPageBody(page: Page): string {
   if (!compiled) return timeline;
   if (!timeline) return compiled;
   return `${compiled}\n\n${timeline}`;
+}
+
+/**
+ * A negative outcome from the chat-only implementation must not mask a rich
+ * meeting after this release adds long-form support. Terminal outcomes remain
+ * authoritative, and Slack negatives remain durable.
+ */
+function durableOutcomeStillApplies(
+  page: Page,
+  outcome: DurableExtractionOutcome,
+): boolean {
+  if (outcome !== 'non_extractable') return true;
+  return splitLongFormMeeting(page, readPageBody(page)).length === 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -765,6 +848,7 @@ interface ExtractCoreState {
   sleepMs: number;
   segmentLimit: number;
   types: AllowedType[];
+  operatorSinceIso: string | undefined;
   signal: AbortSignal | undefined;
   /** Run start (ms) + wall-clock deadline (ms). deadlineMs=0 ⇒ unbounded. */
   startedAt: number;
@@ -863,6 +947,29 @@ async function processPage(
   // 1970-01-01. Now they pick up the correct date.
   const parseResult = parseConversation(body, { page });
   let messages = parseResult.messages;
+  let cp = state.cpMap.get(cpMapKey(state.sourceId, page.slug));
+  const allLongFormSegments = splitLongFormMeeting(page, body);
+  if (
+    cp &&
+    allLongFormSegments.length > 0 &&
+    Date.parse(allLongFormSegments[0].startIso) > Date.parse(cp.endIso)
+  ) {
+    // Long-form summaries are re-chunked as a whole when their page changes.
+    // Drop the old resume watermark so replay cleanup replaces (rather than
+    // appends duplicate) CLI facts. Preserve an explicit operator --since.
+    state.cpMap.delete(cpMapKey(state.sourceId, page.slug));
+    cp = undefined;
+    sinceIso = state.operatorSinceIso;
+  }
+  const longFormSegments = allLongFormSegments.length > 0
+    ? splitLongFormMeeting(page, body, { sinceIso })
+    : [];
+  if (allLongFormSegments.length > 0) {
+    state.result.pages_long_form_meeting = (state.result.pages_long_form_meeting ?? 0) + 1;
+    process.stderr.write(
+      `[extract-conversation-facts] long-form meeting split ${allLongFormSegments.length} extraction unit(s) for ${page.slug}\n`,
+    );
+  }
   // A regex miss is not a durable negative unless the configured LLM
   // fallback also runs successfully. This keeps future parser/fallback
   // improvements from being masked by an old not-applicable marker.
@@ -888,6 +995,7 @@ async function processPage(
   // skipped. Fail-open: any error leaves `messages` empty and the page skipped.
   if (
     messages.length === 0 &&
+    allLongFormSegments.length === 0 &&
     parseResult.phase === 'no_match' &&
     state.llmFallbackEnabled &&
     state.llmFallbackModel
@@ -942,9 +1050,12 @@ async function processPage(
       );
     }
   }
-  const cp = state.cpMap.get(cpMapKey(state.sourceId, page.slug));
-  const allSegments = splitIntoSegments(messages);
-  const segments = splitIntoSegments(messages, { sinceIso });
+  const allSegments = allLongFormSegments.length > 0
+    ? allLongFormSegments
+    : splitIntoSegments(messages);
+  const segments = allLongFormSegments.length > 0
+    ? longFormSegments
+    : splitIntoSegments(messages, { sinceIso });
   if (segments.length === 0) {
     state.result.pages_skipped++;
     if (!state.dryRun && scanWasDefinitive) {
@@ -1249,6 +1360,7 @@ export async function runExtractConversationFactsCore(
     pages_skipped_completed: 0,
     pages_skipped_non_extractable: 0,
     pages_marked_non_extractable: 0,
+    pages_long_form_meeting: 0,
     pages_lock_skipped: 0,
     orphan_facts_cleaned: 0,
     segments_processed: 0,
@@ -1321,6 +1433,7 @@ export async function runExtractConversationFactsCore(
     sleepMs,
     segmentLimit,
     types,
+    operatorSinceIso: opts.sinceIso,
     signal,
     startedAt: Date.now(),
     deadlineMs: opts.deadlineMs && opts.deadlineMs > 0 ? opts.deadlineMs : 0,
@@ -1375,7 +1488,7 @@ export async function runExtractConversationFactsCore(
                 [page],
               );
               const outcome = fresh.get(page.slug);
-              if (outcome) {
+              if (outcome && durableOutcomeStillApplies(page, outcome)) {
                 recordDurableOutcomeSkip(state, outcome);
                 return { newEndIso: null };
               }
@@ -1460,6 +1573,7 @@ export async function runExtractConversationFactsCore(
             claimable = claimable.filter((page) => {
               const outcome = fresh.get(page.slug);
               if (!outcome) return true;
+              if (!durableOutcomeStillApplies(page, outcome)) return true;
               recordDurableOutcomeSkip(state, outcome);
               return false;
             });
@@ -1841,6 +1955,7 @@ export async function runExtractConversationFacts(
     pages_skipped_completed: 0,
     pages_skipped_non_extractable: 0,
     pages_marked_non_extractable: 0,
+    pages_long_form_meeting: 0,
     pages_lock_skipped: 0,
     orphan_facts_cleaned: 0,
     segments_processed: 0,
@@ -1884,6 +1999,8 @@ export async function runExtractConversationFacts(
       aggregate.pages_skipped_completed += perSource.pages_skipped_completed;
       aggregate.pages_skipped_non_extractable += perSource.pages_skipped_non_extractable;
       aggregate.pages_marked_non_extractable += perSource.pages_marked_non_extractable;
+      aggregate.pages_long_form_meeting =
+        (aggregate.pages_long_form_meeting ?? 0) + (perSource.pages_long_form_meeting ?? 0);
       aggregate.pages_lock_skipped += perSource.pages_lock_skipped;
       aggregate.orphan_facts_cleaned += perSource.orphan_facts_cleaned;
       aggregate.segments_processed += perSource.segments_processed;
@@ -1923,6 +2040,9 @@ export async function runExtractConversationFacts(
   }
   if (aggregate.pages_marked_non_extractable > 0) {
     console.log(`  Marked ${aggregate.pages_marked_non_extractable} page(s) as scanned, not extractable.`);
+  }
+  if ((aggregate.pages_long_form_meeting ?? 0) > 0) {
+    console.log(`  Routed ${aggregate.pages_long_form_meeting} structured meeting page(s) through long-form fact extraction.`);
   }
   if (aggregate.pages_lock_skipped > 0) {
     console.log(`  Skipped ${aggregate.pages_lock_skipped} page(s) held by another worker / process (will retry next run).`);
