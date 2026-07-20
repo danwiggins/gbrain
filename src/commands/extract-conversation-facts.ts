@@ -147,6 +147,14 @@ export const ALLOWED_TYPES = ['conversation', 'meeting', 'slack', 'email'] as co
 export type AllowedType = (typeof ALLOWED_TYPES)[number];
 
 /**
+ * Safe default for bulk/cycle backfills. Email pages are intentionally
+ * excluded: durable email ingestion already runs the real-time fact
+ * extractor, and thread aggregation is the right long-form unit. Operators
+ * can still opt in explicitly with `--types email`.
+ */
+export const DEFAULT_TYPES: readonly AllowedType[] = ['meeting', 'slack'];
+
+/**
  * Pagination batch size for listPages enumeration. Per-batch memory
  * worst case = BATCH × MAX_PAGE_BODY_BYTES = 250MB at default 10
  * (Eng-v2 C8 — bounded vs PR's unbounded listPages limit:500 = 12.5GB).
@@ -169,6 +177,15 @@ export const PER_SEGMENT_SOURCE_PREFIX = 'cli:extract-conversation-facts';
  * stays in backlog.
  */
 export const TERMINAL_AUDIT_SOURCE = 'cli:extract-conversation-facts:terminal';
+
+/**
+ * Durable outcome for pages that were scanned successfully but did not
+ * contain a multi-message conversation segment. Kept separate from the
+ * completion marker so doctor/operator surfaces can distinguish extracted
+ * from not applicable without retrying the page forever.
+ */
+export const NON_EXTRACTABLE_AUDIT_SOURCE =
+  'cli:extract-conversation-facts:non-extractable';
 
 // ---------------------------------------------------------------------------
 // Public types.
@@ -260,6 +277,12 @@ export interface ExtractConversationFactsResult {
   pages_skipped: number;
   pages_skipped_too_large: number;
   pages_skipped_disappeared: number;
+  /** Fresh terminal outcomes skipped before parser/LLM work. */
+  pages_skipped_completed: number;
+  /** Fresh scanned-not-extractable outcomes skipped before parser/LLM work. */
+  pages_skipped_non_extractable: number;
+  /** New durable scanned-not-extractable outcomes written by this run. */
+  pages_marked_non_extractable: number;
   /** v0.42.x: pages whose built-in regex parse missed but the opt-in LLM
    *  fallback recovered messages from. Absent/0 when the fallback is off. */
   pages_llm_fallback?: number;
@@ -561,9 +584,10 @@ async function resolveTypesFromConfig(
       // fall through to default
     }
   }
-  // Default: full allowlist when no config and no explicit override.
+  // Default: meetings + Slack. Email uses the real-time fact extractor or
+  // thread aggregation; conversation remains an explicit opt-in.
   // Mirrors cycle.conversation_facts_backfill.types default.
-  return [...ALLOWED_TYPES];
+  return [...DEFAULT_TYPES];
 }
 
 // ---------------------------------------------------------------------------
@@ -614,6 +638,59 @@ function logLockBusyRateLimited(sourceId: string, slug: string): void {
   process.stderr.write(
     `[extract-conversation-facts] lock-busy for ${sourceId}:${slug} (and possibly more); skipping — another worker holds it. Page will be retried on next enumeration.\n`,
   );
+}
+
+type DurableExtractionOutcome = 'complete' | 'non_extractable';
+
+/**
+ * Return durable outcomes that are at least as new as the page itself.
+ * Comparing facts.created_at to pages.updated_at means an appended message
+ * automatically makes the old outcome stale and eligible for reprocessing.
+ */
+async function findFreshExtractionOutcomes(
+  engine: BrainEngine,
+  sourceId: string,
+  pages: readonly Page[],
+): Promise<Map<string, DurableExtractionOutcome>> {
+  if (pages.length === 0) return new Map();
+  const rows = await engine.executeRaw<{ slug: string; source: string }>(
+    `SELECT p.slug, f.source
+       FROM pages p
+       JOIN facts f
+         ON f.source_id = p.source_id
+        AND f.source_markdown_slug = p.slug
+        AND f.source = ANY($3::text[])
+        AND f.source_session = f.source || ':' || p.slug
+        AND f.created_at >= p.updated_at
+      WHERE p.source_id = $1
+        AND p.slug = ANY($2::text[])
+      ORDER BY p.slug,
+        CASE WHEN f.source = $4 THEN 0 ELSE 1 END`,
+    [
+      sourceId,
+      pages.map((page) => page.slug),
+      [TERMINAL_AUDIT_SOURCE, NON_EXTRACTABLE_AUDIT_SOURCE],
+      TERMINAL_AUDIT_SOURCE,
+    ],
+  );
+  const outcomes = new Map<string, DurableExtractionOutcome>();
+  for (const row of rows) {
+    if (outcomes.has(row.slug)) continue;
+    outcomes.set(
+      row.slug,
+      row.source === TERMINAL_AUDIT_SOURCE ? 'complete' : 'non_extractable',
+    );
+  }
+  return outcomes;
+}
+
+function recordDurableOutcomeSkip(
+  state: ExtractCoreState,
+  outcome: DurableExtractionOutcome,
+): void {
+  state.result.pages_considered++;
+  if (outcome === 'complete') state.result.pages_skipped_completed++;
+  else state.result.pages_skipped_non_extractable++;
 }
 
 /**
@@ -786,6 +863,10 @@ async function processPage(
   // 1970-01-01. Now they pick up the correct date.
   const parseResult = parseConversation(body, { page });
   let messages = parseResult.messages;
+  // A regex miss is not a durable negative unless the configured LLM
+  // fallback also runs successfully. This keeps future parser/fallback
+  // improvements from being masked by an old not-applicable marker.
+  let scanWasDefinitive = parseResult.phase !== 'no_match';
   if (parseResult.timezone_warning) {
     process.stderr.write(parseResult.timezone_warning + '\n');
   }
@@ -835,12 +916,19 @@ async function processPage(
         state.deadlineHit.value = true;
         return { newEndIso: null };
       }
+      if (fb !== null) {
+        scanWasDefinitive = true;
+      }
       if (fb && fb.length > 0) {
         messages = fb;
         state.result.pages_llm_fallback = (state.result.pages_llm_fallback ?? 0) + 1;
         process.stderr.write(
           `[extract-conversation-facts] LLM-fallback parsed ${fb.length} message(s) for ${page.slug}\n`,
         );
+      } else if (fb === null) {
+        // Provider/transport/parse failure is not evidence that the page is
+        // non-extractable. Leave it unfinished so a later run retries.
+        scanWasDefinitive = false;
       }
     } catch (err) {
       if (pageDeadlineSignal?.aborted && !state.signal?.aborted) {
@@ -854,9 +942,51 @@ async function processPage(
       );
     }
   }
+  const cp = state.cpMap.get(cpMapKey(state.sourceId, page.slug));
+  const allSegments = splitIntoSegments(messages);
   const segments = splitIntoSegments(messages, { sinceIso });
   if (segments.length === 0) {
     state.result.pages_skipped++;
+    if (!state.dryRun && scanWasDefinitive) {
+      if (cp && allSegments.length > 0) {
+        // Every eligible segment is already behind the persisted watermark,
+        // but a prior run died before writing its terminal row. Close that
+        // durable state without paying for extraction again.
+        await writeTerminalAuditRow(
+          state.engine,
+          state.sourceId,
+          page.slug,
+          cp.rowNum,
+        );
+        state.cpMap.set(cpMapKey(state.sourceId, page.slug), {
+          endIso: cp.endIso,
+          rowNum: cp.rowNum + 1,
+        });
+      } else if (allSegments.length === 0) {
+        const cleaned = await deleteOrphanFactsForPage(
+          state.engine,
+          state.sourceId,
+          page.slug,
+          0,
+        );
+        state.result.orphan_facts_cleaned += cleaned;
+        const rowNum = await peekRowNumStart(
+          state.engine,
+          state.sourceId,
+          page.slug,
+        );
+        await writeNonExtractableAuditRow(
+          state.engine,
+          state.sourceId,
+          page.slug,
+          rowNum,
+          messages.length === 0
+            ? 'no conversation messages found'
+            : 'fewer than two eligible messages',
+        );
+        state.result.pages_marked_non_extractable++;
+      }
+    }
     return { newEndIso: null };
   }
 
@@ -864,7 +994,6 @@ async function processPage(
   // committed AND persisted for this page. sinceIso (computed by the caller
   // from the same cp.endIso) already excludes those committed segments, so
   // `segments` above is only the uncommitted tail.
-  const cp = state.cpMap.get(cpMapKey(state.sourceId, page.slug));
   const resumeRowNum = cp?.rowNum ?? 0;
 
   // D11: delete-orphans-first replay safety, SCOPED to the uncommitted tail.
@@ -1069,6 +1198,28 @@ async function writeTerminalAuditRow(
   await engine.insertFacts([fact], { source_id: sourceId }); // gbrain-allow-direct-insert: page-level TERMINAL audit row (Codex C7 / E16) marks extraction completion in the durable facts table — there's no fence equivalent because this is internal audit state, not user-facing knowledge
 }
 
+async function writeNonExtractableAuditRow(
+  engine: BrainEngine,
+  sourceId: string,
+  slug: string,
+  rowNum: number,
+  reason: string,
+): Promise<void> {
+  const fact: NewFact & { row_num: number; source_markdown_slug: string } = {
+    fact: 'EXTRACTION_NOT_APPLICABLE',
+    kind: 'fact',
+    entity_slug: null,
+    source: NON_EXTRACTABLE_AUDIT_SOURCE,
+    source_session: `${NON_EXTRACTABLE_AUDIT_SOURCE}:${slug}`,
+    confidence: 1.0,
+    notability: 'low',
+    context: `scanned, not extractable: ${reason}`,
+    row_num: rowNum,
+    source_markdown_slug: slug,
+  };
+  await engine.insertFacts([fact], { source_id: sourceId }); // gbrain-allow-direct-insert: durable non-extractable audit outcome prevents repeated scans while keeping this state separate from successful extraction completion
+}
+
 /**
  * Core entry point — one source per call. Caller (CLI / Minion / cycle
  * phase) handles multi-source iteration externally.
@@ -1095,6 +1246,9 @@ export async function runExtractConversationFactsCore(
     pages_skipped: 0,
     pages_skipped_too_large: 0,
     pages_skipped_disappeared: 0,
+    pages_skipped_completed: 0,
+    pages_skipped_non_extractable: 0,
+    pages_marked_non_extractable: 0,
     pages_lock_skipped: 0,
     orphan_facts_cleaned: 0,
     segments_processed: 0,
@@ -1122,7 +1276,12 @@ export async function runExtractConversationFactsCore(
     await assertFactsEmbeddingDimMatchesConfig(engine);
   }
 
-  const types = await resolveTypesFromConfig(engine, opts.types);
+  // A targeted --slug run is an explicit operator choice, so retain support
+  // for every eligible conversation type. Bulk runs use the safer default of
+  // meeting + slack unless --types is supplied.
+  const types = opts.slug && !opts.types
+    ? [...ALLOWED_TYPES]
+    : await resolveTypesFromConfig(engine, opts.types);
   const dryRun = !!opts.dryRun;
   const sleepMs = opts.sleepMs ?? DEFAULT_INTER_CALL_SLEEP_MS;
   const segmentLimit = opts.segmentLimit ?? 0;
@@ -1206,7 +1365,23 @@ export async function runExtractConversationFactsCore(
         await withRefreshingLock(
           engine,
           lockId,
-          () => processPage(state, page, sinceIso),
+          async () => {
+            // Re-check after acquiring the lock. Another process may have
+            // completed this page between batch selection and our claim.
+            if (!opts.force) {
+              const fresh = await findFreshExtractionOutcomes(
+                engine,
+                sourceId,
+                [page],
+              );
+              const outcome = fresh.get(page.slug);
+              if (outcome) {
+                recordDurableOutcomeSkip(state, outcome);
+                return { newEndIso: null };
+              }
+            }
+            return processPage(state, page, sinceIso);
+          },
           { ttlMinutes: PER_PAGE_LOCK_TTL_MINUTES },
         ).then(() => undefined);
       } catch (err) {
@@ -1271,6 +1446,23 @@ export async function runExtractConversationFactsCore(
           if (opts.limit) {
             const remaining = opts.limit - processedPagesCount;
             if (remaining < batch.length) claimable = batch.slice(0, remaining);
+          }
+
+          // Durable selection gate: skip pages with a fresh terminal or
+          // scanned-not-extractable outcome before lock acquisition, parsing,
+          // or any LLM call. Checkpoint GC cannot make completed pages return.
+          if (!opts.force && claimable.length > 0) {
+            const fresh = await findFreshExtractionOutcomes(
+              engine,
+              sourceId,
+              claimable,
+            );
+            claimable = claimable.filter((page) => {
+              const outcome = fresh.get(page.slug);
+              if (!outcome) return true;
+              recordDurableOutcomeSkip(state, outcome);
+              return false;
+            });
           }
 
           await runSlidingPool({
@@ -1550,7 +1742,8 @@ Options:
   --source-id <id>       Source to operate on (default: 'default').
   --types <list>         Comma-separated subset of: ${ALLOWED_TYPES.join(', ')}.
                          Default: reads cycle.conversation_facts_backfill.types config
-                         (falls back to the full allowlist).
+                         (falls back to meeting,slack). Email is explicit-only;
+                         use thread aggregation or real-time extraction by default.
   --slug <slug>          Process a single page (overrides multi-page enumeration).
   --dry-run              Show segmentation + counts; no DB writes, no checkpoint advance.
   --limit <N>            Cap pages processed (default: all).
@@ -1578,9 +1771,10 @@ sources from gbrain sources list. Per-source budget cap defaults to
 --max-cost-usd; the brain-wide cap when running via the autopilot cycle
 phase is cycle.conversation_facts_backfill.max_total_cost_usd.
 
-Resumability: per-page completion is durable via a terminal audit row
-in the facts table (source='${TERMINAL_AUDIT_SOURCE}'). gbrain doctor's
-conversation_facts_backlog check counts pages without this row.
+Resumability: per-page outcomes are durable via terminal and scanned-not-
+extractable audit rows in the facts table. Outcomes older than the page are
+stale automatically, so appended content is reprocessed. gbrain doctor's
+conversation_facts_backlog check counts only pages without a fresh outcome.
 `;
 
 function buildJobParams(args: string[]): Record<string, unknown> {
@@ -1644,6 +1838,9 @@ export async function runExtractConversationFacts(
     pages_skipped: 0,
     pages_skipped_too_large: 0,
     pages_skipped_disappeared: 0,
+    pages_skipped_completed: 0,
+    pages_skipped_non_extractable: 0,
+    pages_marked_non_extractable: 0,
     pages_lock_skipped: 0,
     orphan_facts_cleaned: 0,
     segments_processed: 0,
@@ -1684,6 +1881,9 @@ export async function runExtractConversationFacts(
       aggregate.pages_skipped += perSource.pages_skipped;
       aggregate.pages_skipped_too_large += perSource.pages_skipped_too_large;
       aggregate.pages_skipped_disappeared += perSource.pages_skipped_disappeared;
+      aggregate.pages_skipped_completed += perSource.pages_skipped_completed;
+      aggregate.pages_skipped_non_extractable += perSource.pages_skipped_non_extractable;
+      aggregate.pages_marked_non_extractable += perSource.pages_marked_non_extractable;
       aggregate.pages_lock_skipped += perSource.pages_lock_skipped;
       aggregate.orphan_facts_cleaned += perSource.orphan_facts_cleaned;
       aggregate.segments_processed += perSource.segments_processed;
@@ -1714,6 +1914,15 @@ export async function runExtractConversationFacts(
   }
   if (aggregate.pages_skipped_disappeared > 0) {
     console.log(`  Skipped ${aggregate.pages_skipped_disappeared} page(s) that disappeared between enumeration and fetch.`);
+  }
+  if (aggregate.pages_skipped_completed > 0) {
+    console.log(`  Skipped ${aggregate.pages_skipped_completed} page(s) with fresh durable completion outcomes.`);
+  }
+  if (aggregate.pages_skipped_non_extractable > 0) {
+    console.log(`  Skipped ${aggregate.pages_skipped_non_extractable} page(s) previously scanned as not extractable.`);
+  }
+  if (aggregate.pages_marked_non_extractable > 0) {
+    console.log(`  Marked ${aggregate.pages_marked_non_extractable} page(s) as scanned, not extractable.`);
   }
   if (aggregate.pages_lock_skipped > 0) {
     console.log(`  Skipped ${aggregate.pages_lock_skipped} page(s) held by another worker / process (will retry next run).`);

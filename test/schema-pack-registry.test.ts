@@ -43,6 +43,17 @@ function chainLoader(byName: Record<string, SchemaPackManifest>) {
   };
 }
 
+function pageType(name: string, prefix: string) {
+  return {
+    name,
+    primitive: 'concept' as const,
+    path_prefixes: [prefix],
+    aliases: [],
+    extractable: false,
+    expert_routing: false,
+  };
+}
+
 beforeEach(() => {
   _resetPackCacheForTests();
 });
@@ -76,6 +87,47 @@ describe('resolvePack — happy path', () => {
     const ra = await resolvePack(a, noop);
     const rb = await resolvePack(b, noop);
     expect(ra.identity).not.toBe(rb.identity);
+  });
+
+  test('materializes inherited page types and keeps child identity wire-stable', async () => {
+    const parent = makeManifest('parent');
+    parent.page_types = [pageType('meeting', 'meetings/')];
+    const child = makeManifest('child', 'parent');
+    child.page_types = [pageType('experiment', 'experiments/')];
+
+    const resolved = await resolvePack(child, chainLoader({ parent }));
+    expect(resolved.manifest.page_types.map((entry) => entry.name)).toEqual([
+      'meeting',
+      'experiment',
+    ]);
+    expect(resolved.identity).toMatch(/^child@1\.0\.0\+/);
+  });
+
+  test('child declaration replaces an inherited type in place', async () => {
+    const parent = makeManifest('parent');
+    parent.page_types = [
+      pageType('meeting', 'legacy-meetings/'),
+      pageType('note', 'notes/'),
+    ];
+    const child = makeManifest('child', 'parent');
+    child.page_types = [pageType('meeting', 'meetings/')];
+
+    const resolved = await resolvePack(child, chainLoader({ parent }));
+    expect(resolved.manifest.page_types.map((entry) => entry.name)).toEqual([
+      'meeting',
+      'note',
+    ]);
+    expect(resolved.manifest.page_types[0]?.path_prefixes).toEqual(['meetings/']);
+  });
+
+  test('does not inherit phase participation from a parent', async () => {
+    const parent = makeManifest('parent');
+    parent.phases = ['extract_atoms'];
+    const child = makeManifest('child', 'parent');
+    child.phases = undefined;
+
+    const resolved = await resolvePack(child, chainLoader({ parent }));
+    expect(resolved.manifest.phases).toBeUndefined();
   });
 });
 

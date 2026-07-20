@@ -170,6 +170,17 @@ enrichable_types: []
 filing_rules: []
 ```
 
+### Inheritance behavior
+
+`extends` is materialized from the root pack to the active leaf pack. Page
+types, link types, enrichable types, frontmatter links, filing rules, take
+kinds, and calibration domains are inherited. When parent and child declare
+the same named entry, the child declaration wins in the inherited position.
+
+Cycle `phases` are deliberately not inherited. A child must list every
+model-spend phase it wants to run, so extending a pack cannot silently increase
+maintenance spend.
+
 ## Recovery + revert
 
 The single-PR cathedral is hard to revert atomically. Per codex finding

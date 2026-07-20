@@ -221,6 +221,115 @@ export function _cacheNamesForTests(): string[] {
   return [..._byName.keys()];
 }
 
+function mergeEntriesByKey<T>(
+  inherited: readonly T[],
+  local: readonly T[],
+  keyOf: (entry: T) => string,
+): T[] {
+  const merged = inherited.map((entry) => entry);
+  const indexByName = new Map(merged.map((entry, index) => [keyOf(entry), index]));
+  for (const entry of local) {
+    const key = keyOf(entry);
+    const index = indexByName.get(key);
+    if (index === undefined) {
+      indexByName.set(key, merged.length);
+      merged.push(entry);
+    } else {
+      // Child declaration replaces the inherited declaration in place so
+      // path-prefix precedence stays deterministic while child-wins.
+      merged[index] = entry;
+    }
+  }
+  return merged;
+}
+
+function mergeNamedEntries<T extends { name: string }>(
+  inherited: readonly T[],
+  local: readonly T[],
+): T[] {
+  return mergeEntriesByKey(inherited, local, (entry) => entry.name);
+}
+
+function mergeUniqueStrings(
+  inherited: readonly string[],
+  local: readonly string[],
+): string[] {
+  return Array.from(new Set([...inherited, ...local]));
+}
+
+/** Materialize the extends chain from root to leaf. Phases remain local. */
+function materializeExtendsChain(
+  chain: readonly SchemaPackManifest[],
+): SchemaPackManifest {
+  const leaf = chain[0]!;
+  let pageTypes: SchemaPackManifest['page_types'] = [];
+  let linkTypes: SchemaPackManifest['link_types'] = [];
+  let frontmatterLinks: SchemaPackManifest['frontmatter_links'] = [];
+  let enrichableTypes: SchemaPackManifest['enrichable_types'] = [];
+  let filingRules: SchemaPackManifest['filing_rules'] = [];
+  let takesKinds: string[] = [];
+  let calibrationDomains: NonNullable<SchemaPackManifest['calibration_domains']> = [];
+
+  for (const current of [...chain].reverse()) {
+    pageTypes = mergeNamedEntries(pageTypes, current.page_types);
+    linkTypes = mergeNamedEntries(linkTypes, current.link_types);
+    enrichableTypes = mergeEntriesByKey(
+      enrichableTypes,
+      current.enrichable_types,
+      (entry) => entry.type,
+    );
+    calibrationDomains = mergeNamedEntries(
+      calibrationDomains,
+      current.calibration_domains ?? [],
+    );
+    takesKinds = mergeUniqueStrings(takesKinds, current.takes_kinds);
+
+    const frontmatterSeen = new Set(
+      frontmatterLinks.map((entry) =>
+        `${entry.page_type}|${entry.link_type}|${entry.fields.join(',')}`,
+      ),
+    );
+    for (const entry of current.frontmatter_links) {
+      const key = `${entry.page_type}|${entry.link_type}|${entry.fields.join(',')}`;
+      if (!frontmatterSeen.has(key)) {
+        frontmatterSeen.add(key);
+        frontmatterLinks.push(entry);
+      }
+    }
+
+    const filingSeen = new Set(
+      filingRules.map((entry) => `${entry.kind}|${entry.directory}`),
+    );
+    for (const entry of current.filing_rules) {
+      const key = `${entry.kind}|${entry.directory}`;
+      const prior = filingRules.findIndex(
+        (candidate) => `${candidate.kind}|${candidate.directory}` === key,
+      );
+      if (prior >= 0) filingRules[prior] = entry;
+      else if (!filingSeen.has(key)) {
+        filingSeen.add(key);
+        filingRules.push(entry);
+      }
+    }
+  }
+
+  return {
+    ...leaf,
+    page_types: pageTypes,
+    link_types: linkTypes,
+    frontmatter_links: frontmatterLinks,
+    takes_kinds: takesKinds,
+    enrichable_types: enrichableTypes,
+    filing_rules: filingRules,
+    calibration_domains: calibrationDomains.length > 0
+      ? calibrationDomains
+      : leaf.calibration_domains,
+    // Phase participation is deliberately local per the manifest contract;
+    // extending a pack never opts a user into a parent's cycle spend.
+    phases: leaf.phases,
+  };
+}
+
 /**
  * Resolve + cache a manifest. Loads parent packs via the `loadByName`
  * dependency, tracks extends-chain depth, applies the E4 cap.
@@ -258,6 +367,7 @@ export async function resolvePack(
   // cache snapshot (codex C6 — child cache entry must remember every
   // parent so invalidatePackCache(parentName) can cascade).
   const chain: string[] = [manifest.name];
+  const chainManifests: SchemaPackManifest[] = [manifest];
   let cursor: SchemaPackManifest | null = manifest;
   while (cursor?.extends) {
     const parentName = cursor.extends;
@@ -272,15 +382,15 @@ export async function resolvePack(
       opts.onDepthWarn?.(chain.length, chain);
     }
     cursor = await loadByName(parentName);
+    chainManifests.push(cursor);
   }
 
-  // For v0.38 skeleton: closure is computed on the manifest itself.
-  // Full extends-merging (child-wins) is the v0.41+ T20 follow-up.
-  const alias_graph = buildAliasGraph(manifest);
-  const alias_closure_hash = await computeAliasClosureHash(manifest);
+  const effectiveManifest = materializeExtendsChain(chainManifests);
+  const alias_graph = buildAliasGraph(effectiveManifest);
+  const alias_closure_hash = await computeAliasClosureHash(effectiveManifest);
 
   const resolved: ResolvedPack = {
-    manifest,
+    manifest: effectiveManifest,
     identity: id,
     manifest_sha8: sha8,
     alias_closure_hash,
