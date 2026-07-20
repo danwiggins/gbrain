@@ -479,6 +479,42 @@ describe('bold-paren-time pattern (Circleback meeting transcripts)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// bold-time-dash pattern (normalized Slack markdown)
+// ---------------------------------------------------------------------------
+
+describe('bold-time-dash pattern (normalized Slack markdown)', () => {
+  test('parses anchors and preserves multi-line continuation text', () => {
+    const body = [
+      '# #team-channel — 2026-04-09',
+      '**Alice Example** 09:15 — first line',
+      '• detailed bullet one',
+      '• detailed bullet two',
+      '**Openclaw** 09:18 — second message',
+      'continuation of second message',
+      '**Bob Example** 10:01 — final message',
+    ].join('\n');
+    const r = parseConversation(body, { fallbackDate: '2026-04-09' });
+    expect(r.phase).toBe('regex_match');
+    expect(r.matched_pattern_id).toBe('bold-time-dash');
+    expect(r.messages).toHaveLength(3);
+    expect(r.messages[0]).toEqual({
+      speaker: 'Alice Example',
+      timestamp: '2026-04-09T09:15:00Z',
+      text: 'first line\n• detailed bullet one\n• detailed bullet two',
+    });
+    expect(r.messages[1].text).toBe('second message\ncontinuation of second message');
+    expect(r.messages[2].timestamp).toBe('2026-04-09T10:01:00Z');
+  });
+
+  test('does not shadow existing bold transcript formats', () => {
+    expect(parseConversation('**Alice** (00:00): hello', { fallbackDate: '2026-04-09' }).matched_pattern_id)
+      .toBe('bold-paren-time');
+    expect(parseConversation('**Alice:** hello', { fallbackDate: '2026-04-09' }).matched_pattern_id)
+      .toBe('bold-name-no-time');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // bold-name-no-time pattern (Circleback / Granola / Zoom transcripts with NO
 // per-line timestamp — `**Speaker:** text`). Additive pattern; the colon
 // inside the bold markers + the `(?!\[)` lookahead are what keep it from
