@@ -53,7 +53,7 @@ export interface SourceFailure { count: number; lastFailedAt: Date; }
 export interface CooldownOpts { baseMin: number; capMin: number; }
 
 export interface FanoutOpts {
-  repoPath: string;
+  repoPath: string | null;
   slot: string;
   timeoutMs: number;
   /**
@@ -375,7 +375,9 @@ export async function dispatchPerSource(
 
   let sources: SourceRow[];
   try {
-    sources = await engine.listAllSources({ localPathOnly: true });
+    // Include database-only sources. Filesystem phases bind to each source's
+    // own local_path and skip cleanly when it is absent.
+    sources = await engine.listAllSources();
   } catch (e) {
     // Brand-new brain without sources table (pre-v0.18) — fall through
     // to the legacy single-job path. The error path here also covers
@@ -533,7 +535,7 @@ export function isGlobalMaintenanceStale(lastGlobalAtIso: string | null, now = D
 export async function dispatchGlobalMaintenance(
   engine: BrainEngine,
   queue: MinionQueue,
-  opts: { repoPath: string; slot: string; timeoutMs: number; jsonMode: boolean; emit?: (l: string) => void; log?: (l: string) => void },
+  opts: { repoPath: string | null; slot: string; timeoutMs: number; jsonMode: boolean; emit?: (l: string) => void; log?: (l: string) => void },
 ): Promise<{ dispatched: boolean; reason: 'stale' | 'fresh' }> {
   const emit = opts.emit ?? ((line) => process.stderr.write(line + '\n'));
   const log = opts.log ?? ((line) => console.log(line));
