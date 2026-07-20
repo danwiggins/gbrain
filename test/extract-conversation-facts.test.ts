@@ -14,6 +14,7 @@
 import { describe, expect, test, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { withEnv } from './helpers/with-env.ts';
+import type { Page } from '../src/core/types.ts';
 import {
   __setChatTransportForTests,
   __setEmbedTransportForTests,
@@ -23,6 +24,7 @@ import {
 import {
   parseConversationMessages,
   splitIntoSegments,
+  splitLongFormMeeting,
   renderSegmentForExtraction,
   runExtractConversationFactsCore,
   extractConversationFactsFingerprint,
@@ -31,6 +33,7 @@ import {
   DEFAULT_SEGMENT_GAP_MINUTES,
   DEFAULT_SEGMENT_MAX_MESSAGES,
   SEGMENT_TEXT_CHAR_LIMIT,
+  LONG_FORM_MEETING_CHUNK_CHARS,
   MAX_PAGE_BODY_BYTES,
   TERMINAL_AUDIT_SOURCE,
   NON_EXTRACTABLE_AUDIT_SOURCE,
@@ -161,6 +164,40 @@ describe('splitIntoSegments', () => {
   });
 });
 
+describe('splitLongFormMeeting', () => {
+  const page: Page = {
+    id: 1,
+    source_id: 'default',
+    slug: 'meetings/structured-summary',
+    type: 'meeting',
+    title: 'Structured meeting summary',
+    compiled_truth: '',
+    timeline: '',
+    frontmatter: {},
+    created_at: new Date('2026-07-20T10:00:00Z'),
+    updated_at: new Date('2026-07-20T12:00:00Z'),
+  };
+
+  test('chunks rich meeting notes without requiring chat-shaped messages', () => {
+    const body = `## Overview\n${'A grounded scientific update. '.repeat(220)}\n\n## Action items\nDan will review the assay.`;
+    const segments = splitLongFormMeeting(page, body);
+    expect(segments.length).toBeGreaterThan(1);
+    expect(segments.every((segment) => segment.format === 'long_form_meeting')).toBe(true);
+    expect(segments.every((segment) => segment.messages[0].text.length <= LONG_FORM_MEETING_CHUNK_CHARS)).toBe(true);
+  });
+
+  test('does not route Slack noise or short/unstructured meeting text', () => {
+    expect(splitLongFormMeeting({ ...page, type: 'slack' }, '## Overview\n' + 'x'.repeat(500))).toEqual([]);
+    expect(splitLongFormMeeting(page, 'Alice spoke first. Bob answered later.')).toEqual([]);
+  });
+
+  test('uses updated_at timestamps for freshness-aware resume', () => {
+    const body = `## Summary\n${'Decision and evidence. '.repeat(30)}`;
+    expect(splitLongFormMeeting(page, body, { sinceIso: '2026-07-20T11:59:59Z' })).toHaveLength(1);
+    expect(splitLongFormMeeting(page, body, { sinceIso: '2026-07-20T12:00:00Z' })).toHaveLength(0);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // renderSegmentForExtraction.
 // ---------------------------------------------------------------------------
@@ -191,6 +228,28 @@ describe('renderSegmentForExtraction', () => {
     expect(text.length).toBeLessThanOrEqual(SEGMENT_TEXT_CHAR_LIMIT + 32);
     expect(text.startsWith('Page: big-page')).toBe(true);
     expect(text).toContain('Conversation between');
+  });
+
+  test('labels long-form meeting notes without pretending they are a conversation', () => {
+    const page: Page = {
+      id: 1,
+      source_id: 'default',
+      slug: 'meetings/structured-summary',
+      type: 'meeting',
+      title: 'Structured meeting summary',
+      compiled_truth: '',
+      timeline: '',
+      frontmatter: {},
+      created_at: new Date('2026-07-20T10:00:00Z'),
+      updated_at: new Date('2026-07-20T12:00:00Z'),
+    };
+    const segment = splitLongFormMeeting(
+      page,
+      `## Overview\n${'Grounded update. '.repeat(30)}`,
+    )[0];
+    const text = renderSegmentForExtraction(page.title, segment);
+    expect(text).toContain('Long-form meeting notes updated');
+    expect(text).not.toContain('Conversation between');
   });
 });
 
@@ -487,6 +546,81 @@ describe('runExtractConversationFactsCore', () => {
     });
     expect(second.pages_skipped_non_extractable).toBe(1);
     expect(second.pages_marked_non_extractable).toBe(0);
+  });
+
+  test('extracts facts from rich structured meeting notes instead of marking them non-extractable', async () => {
+    const slug = 'meetings/structured-summary';
+    await engine.putPage(slug, {
+      type: 'meeting',
+      title: 'Structured meeting summary',
+      compiled_truth: `## Overview\n${'CES2 assay evidence and interpretation. '.repeat(20)}\n\n## Action items\nDan will review the assay controls.`,
+      timeline: '',
+      frontmatter: { date: '2026-07-19' },
+    });
+    const result = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug,
+      types: ['meeting'],
+      sleepMs: 0,
+    });
+    expect(result.pages_long_form_meeting).toBe(1);
+    expect(result.pages_processed).toBe(1);
+    expect(result.facts_inserted).toBeGreaterThan(0);
+    expect(result.pages_marked_non_extractable).toBe(0);
+  });
+
+  test('retries a rich meeting hidden by a fresh chat-only negative marker', async () => {
+    const slug = 'meetings/legacy-negative';
+    await engine.putPage(slug, {
+      type: 'meeting',
+      title: 'Legacy negative meeting',
+      compiled_truth: `## Overview\n${'Grounded CES2 evidence and interpretation. '.repeat(20)}\n\n## Action items\nReview the controls.`,
+      timeline: '',
+      frontmatter: { date: '2026-07-19' },
+    });
+    await engine.executeRaw(
+      `INSERT INTO facts (
+         source_id, fact, kind, source, source_session,
+         source_markdown_slug, row_num, valid_from
+       ) VALUES ($1, $2, 'fact', $3, $4, $5, 0, now())`,
+      [
+        'default',
+        'EXTRACTION_NOT_APPLICABLE: legacy chat-only classification',
+        NON_EXTRACTABLE_AUDIT_SOURCE,
+        `${NON_EXTRACTABLE_AUDIT_SOURCE}:${slug}`,
+        slug,
+      ],
+    );
+    const result = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug,
+      types: ['meeting'],
+      sleepMs: 0,
+    });
+    expect(result.pages_skipped_non_extractable).toBe(0);
+    expect(result.pages_processed).toBe(1);
+    expect(result.facts_inserted).toBeGreaterThan(0);
+  });
+
+  test('replaces long-form CLI facts when a structured meeting page changes', async () => {
+    const slug = 'meetings/structured-refresh';
+    const write = (suffix: string) => engine.putPage(slug, {
+      type: 'meeting',
+      title: 'Structured meeting refresh',
+      compiled_truth: `## Summary\n${'A decision grounded in data. '.repeat(20)} ${suffix}`,
+      timeline: '',
+      frontmatter: { date: '2026-07-19' },
+    });
+    await write('first');
+    await runExtractConversationFactsCore(engine, { sourceId: 'default', slug, types: ['meeting'], sleepMs: 0 });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await write('second');
+    await runExtractConversationFactsCore(engine, { sourceId: 'default', slug, types: ['meeting'], sleepMs: 0 });
+    const rows = await engine.executeRaw<{ count: string | number }>(
+      'SELECT COUNT(*) AS count FROM facts WHERE source = $1 AND source_markdown_slug = $2',
+      [PER_SEGMENT_SOURCE_PREFIX, slug],
+    );
+    expect(Number(rows[0]?.count ?? 0)).toBe(1);
   });
 
   test('does not durably classify a regex miss when LLM fallback is disabled', async () => {
