@@ -2,6 +2,19 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.58.5] - 2026-07-20
+
+**Normalized Slack markdown is parsed deterministically instead of relying on a giant LLM JSON response.**
+
+Org-brain Slack pages use message anchors shaped as bold speaker, 24-hour time, and a dash. Five long pages remained unfinished because none of the existing patterns matched; the fallback sampled 200 lines, then repeatedly truncated or failed while producing one 4,000-token JSON array.
+
+- Adds the built-in `bold-time-dash` pattern for em dash, en dash, and ASCII dash variants.
+- Uses the page/frontmatter date and preserves multi-line message bodies, including brief bullets and continuation paragraphs.
+- Avoids overlap with inline-date, parenthesized-time, and no-time bold transcript patterns.
+- Parser and extraction suites prove deterministic matching, timestamps, continuations, and regression safety.
+
+No database migration is required. Re-run the five residual Slack pages once; they will extract grounded segments without fallback spend and receive durable terminal outcomes.
+
 ## [0.42.58.4] - 2026-07-20
 
 **Zero-fact meeting recovery now clears the stale per-page resume checkpoint as well as reopening the false terminal outcome.**

@@ -50,7 +50,7 @@ export function cleanSpeaker(raw: string, override?: RegExp): string {
   return stripped || raw.trim();
 }
 
-/** The 14 hand-vetted built-in patterns. */
+/** The 15 hand-vetted built-in patterns. */
 export const BUILTIN_PATTERNS: readonly PatternEntry[] = [
   // -------------------------------------------------------------------
   // INLINE-DATE patterns (date in every line; less ambiguous; tried first).
@@ -176,6 +176,40 @@ export const BUILTIN_PATTERNS: readonly PatternEntry[] = [
     ],
     source_doc:
       'OpenClaw meeting-ingestion pipeline reformat of Circleback transcripts (see your OpenClaw skills/meeting-ingestion/SKILL.md)',
+  },
+
+  {
+    // Org-brain's normalized Slack pages render message anchors as:
+    //   **Speaker Name** 12:34 — message text
+    // The page title/frontmatter carries the date. Messages may contain long
+    // multi-line brief summaries, so deterministic continuation parsing is
+    // essential: the LLM fallback's single 4K-token JSON response truncates
+    // on these pages and leaves them perpetually unfinished.
+    id: 'bold-time-dash',
+    origin: 'builtin',
+    regex: /^\*\*(.+?)\*\*\s+(\d{1,2}):(\d{2})\s+[-\u2013\u2014]\s*(.*)$/,
+    captures: {
+      speaker_group: 1,
+      hour_group: 2,
+      minute_group: 3,
+      text_group: 4,
+    },
+    date_source: 'frontmatter',
+    time_format: '24h',
+    timezone_policy: 'utc_assumed_with_warn',
+    multi_line: true,
+    quick_reject: /^\*\*/,
+    test_positive: [
+      '**Alice Example** 09:15 — hello world',
+      '**Openclaw** 23:04 – nightly summary follows',
+      '**Bob Example** 7:05 - ASCII dash export',
+    ],
+    test_negative: [
+      '**Alice Example** (09:15): parenthesized meeting shape',
+      '**Alice Example:** no-time transcript shape',
+      '**Alice Example** (2024-03-15 9:00 AM): inline-date shape',
+    ],
+    source_doc: 'org-brain normalized Slack markdown: bold speaker, 24h time, dash, text',
   },
 
   {
