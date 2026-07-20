@@ -115,7 +115,8 @@ gbrain extract timeline --dir ~/brain
 
 ### Dream cycle (v0.23): synthesize + patterns
 
-`gbrain dream` runs the full 8-phase maintenance cycle:
+`gbrain dream` runs the configured maintenance cycle. The core filesystem
+sequence is:
 
 ```
 lint -> backlinks -> sync -> synthesize -> extract -> patterns -> embed -> orphans
@@ -179,6 +180,7 @@ gbrain dream                                       # full 8-phase cycle
 gbrain dream                                          # full cycle
 gbrain dream --phase synthesize                       # just synthesize
 gbrain dream --phase patterns                         # just patterns
+gbrain dream --phase realtime_absorb_recovery         # retry interrupted fact extraction
 gbrain dream --input ~/transcripts/2026-04-25.txt     # ad-hoc one transcript
 gbrain dream --from 2026-04-01 --to 2026-04-25        # backfill range
 gbrain dream --json                                   # CycleReport JSON
@@ -197,8 +199,33 @@ gbrain autopilot --status
 ```
 If not running, install it:
 ```bash
+# Filesystem-backed brain: the checkout must exist on this host.
 gbrain autopilot --install --repo ~/brain
+
+# Postgres/Supabase database-only brain: no checkout is required.
+gbrain autopilot --install
 ```
+For Postgres/Supabase, a configured `sync.repo_path` that does not exist on
+the current host is treated as stale host-local configuration: autopilot warns
+and continues checkoutless with database-only maintenance. Filesystem phases
+skip. An explicitly supplied missing `--repo` still fails closed, and PGLite
+still requires a local checkout.
+
+### Recover interrupted real-time fact extraction
+
+The default-on `realtime_absorb_recovery` cycle phase retries pages with an
+unresolved `facts:absorb` failure. It runs once brain-wide, appends a
+`facts:absorb-recovered` tombstone only after confirmed recovery, and leaves
+failed pages eligible for the next cycle.
+
+```bash
+gbrain dream --phase realtime_absorb_recovery --json
+```
+
+Each pass is bounded by `cycle.realtime_absorb_recovery.max_pages` (default
+25), `max_cost_usd` (default 0.25), and `deadline_seconds` (default 240).
+Its result includes the unresolved remainder.
+
 Autopilot runs sync, extract, and embed in a continuous loop with adaptive scheduling.
 In v0.11.1+, autopilot dispatches each cycle as a single `autopilot-cycle`
 Minion job and supervises the worker child — one install step gives you

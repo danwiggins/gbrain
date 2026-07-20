@@ -2,6 +2,27 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.58.0] - 2026-07-20
+
+**Run a Postgres-backed brain entirely on its always-on server, even if shared configuration still points at a checkout on another computer. Autopilot now continues in database-only mode on Postgres, recovers interrupted fact extraction in bounded passes, and leaves the original source pages untouched.**
+
+### Fixed
+
+- **Postgres autopilot no longer depends on another machine's checkout.** A missing configured repository path is treated as host-local stale configuration: autopilot warns and continues with database-only work. An explicit `--repo` still fails closed, and PGLite still requires its local checkout.
+- **Database-only maintenance runs once per brain.** Sources without `local_path` participate in fan-out, while `realtime_absorb_recovery` runs as one global phase instead of racing once per source. Queued jobs preserve an intentional `repoPath: null` instead of inheriting a path written by a different host.
+- **Interrupted fact extraction advances safely.** The recovery phase reports the unresolved remainder and stays bounded by page, cost, and wall-clock caps. Conversation extraction removes a stale completion marker before retrying an appended tail, and deadlines now cancel both segment extraction and the optional LLM parser fallback.
+- **Autopilot restarts and timeouts are actionable.** Lock takeover uses PID liveness instead of file age, phase progress is persisted in order, and timeout errors name the active phase.
+- **Doctor reports current failures, not recovered history.** Later recovery tombstones remove resolved `facts:absorb` failures from the health count while preserving the append-only audit trail.
+
+### To take advantage of v0.42.58.0
+
+1. Upgrade and restart the autopilot and Minion worker on the VPS.
+2. For a Postgres/Supabase brain with database-only sources, install with `gbrain autopilot --install`. Use `--repo <path>` only when that checkout exists on the same host.
+3. Leave `cycle.realtime_absorb_recovery.enabled` unset (default on), or run one bounded pass with `gbrain dream --phase realtime_absorb_recovery --json`.
+4. Verify with `gbrain doctor`; a timed-out job now names its last persisted phase in `gbrain jobs list --status dead`.
+
+No schema migration is required.
+
 ## [0.42.57.2] - 2026-07-08
 
 ### Fixed
