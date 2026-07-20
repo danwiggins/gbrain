@@ -2954,18 +2954,11 @@ export function computeNightlyQualityProbeHealthCheck(
  *   - OK when enabled=true AND backlog==0 OR no eligible pages exist.
  *   - WARN when enabled=true AND backlog>10.
  *
- * Backlog query uses the page-level TERMINAL audit row check (Eng-v2
- * C7), source-scoped via explicit predicate (Eng-v2 C2). Partial-
- * extraction pages stay in backlog because the terminal row isn't
- * written until ALL segments complete.
- *
- * Known approximation (documented in the details field): "complete"
- * means "terminal row exists" which means "all segments completed in
- * a prior run." A page with the terminal row from one run + new
- * messages since shows OK until the next run picks up new messages
- * and writes a fresh terminal row. The backlog is therefore an UPPER
- * BOUND on "pages with NO extraction at all", not "pages whose facts
- * are current."
+ * Backlog query recognizes two durable, source-scoped outcomes:
+ * extraction complete and scanned-not-extractable. Outcomes count only
+ * while their created_at is at least the page updated_at, so edits reopen
+ * the page for extraction. Partial extraction stays in backlog because no
+ * terminal outcome is written until all segments complete.
  */
 export async function computeConversationFactsBacklogCheck(
   engine: BrainEngine,
@@ -2992,13 +2985,15 @@ export async function computeConversationFactsBacklogCheck(
     const typesRaw = await engine.getConfig(
       'cycle.conversation_facts_backfill.types',
     );
-    let types = ['conversation', 'meeting', 'slack', 'email'];
+    const allowedTypes = ['conversation', 'meeting', 'slack', 'email'];
+    let types = ['meeting', 'slack'];
     if (typesRaw) {
       try {
         const parsed = JSON.parse(typesRaw);
         if (Array.isArray(parsed)) {
           const filtered = parsed.filter(
-            (t): t is string => typeof t === 'string',
+            (t): t is string =>
+              typeof t === 'string' && allowedTypes.includes(t),
           );
           if (filtered.length > 0) types = filtered;
         }
@@ -3007,35 +3002,54 @@ export async function computeConversationFactsBacklogCheck(
       }
     }
 
-    // Source-scoped NOT EXISTS (Eng-v2 C2 + C7):
-    //   - facts.source matches TERMINAL audit source
-    //   - source_session matches terminal:<slug>
-    //   - source_id matches page's source_id (cross-source safety)
-    const rows = await engine.executeRaw<{ count: string | number }>(
-      `SELECT COUNT(*) AS count FROM pages p
-       WHERE p.type = ANY($1::text[])
-         AND p.deleted_at IS NULL
-         AND NOT EXISTS (
-           SELECT 1 FROM facts f
-           WHERE f.source = 'cli:extract-conversation-facts:terminal'
-             AND f.source_session = 'cli:extract-conversation-facts:terminal:' || p.slug
-             AND f.source_id = p.source_id
-         )`,
+    const rows = await engine.executeRaw<{
+      backlog: string | number;
+      completed: string | number;
+      non_extractable: string | number;
+    }>(
+      `WITH outcomes AS (
+         SELECT
+           p.source_id,
+           p.slug,
+           MAX(CASE WHEN f.source = 'cli:extract-conversation-facts:terminal' THEN 1 ELSE 0 END) AS completed,
+           MAX(CASE WHEN f.source = 'cli:extract-conversation-facts:non-extractable' THEN 1 ELSE 0 END) AS non_extractable
+         FROM pages p
+         LEFT JOIN facts f
+           ON f.source_id = p.source_id
+          AND f.source_markdown_slug = p.slug
+          AND f.source IN (
+            'cli:extract-conversation-facts:terminal',
+            'cli:extract-conversation-facts:non-extractable'
+          )
+          AND f.source_session = f.source || ':' || p.slug
+          AND f.created_at >= p.updated_at
+         WHERE p.type = ANY($1::text[])
+           AND p.deleted_at IS NULL
+         GROUP BY p.source_id, p.slug
+       )
+       SELECT
+         COALESCE(SUM(CASE WHEN completed = 0 AND non_extractable = 0 THEN 1 ELSE 0 END), 0) AS backlog,
+         COALESCE(SUM(completed), 0) AS completed,
+         COALESCE(SUM(CASE WHEN completed = 0 THEN non_extractable ELSE 0 END), 0) AS non_extractable
+       FROM outcomes`,
       [types],
     );
 
-    const backlog = Number(rows[0]?.count ?? 0);
+    const backlog = Number(rows[0]?.backlog ?? 0);
+    const completed = Number(rows[0]?.completed ?? 0);
+    const nonExtractable = Number(rows[0]?.non_extractable ?? 0);
 
     if (backlog === 0) {
       return {
         name,
         status: 'ok',
-        message: 'all eligible pages have extraction terminal audit rows',
+        message: 'all eligible pages have fresh durable extraction outcomes',
         details: {
           backlog,
+          completed,
+          scanned_not_extractable: nonExtractable,
           types,
-          known_approximation:
-            'backlog counts pages with NO extraction terminal row; pages with new messages since prior extraction may show OK until next run',
+          freshness_rule: 'outcome.created_at >= page.updated_at',
         },
       };
     }
@@ -3049,10 +3063,11 @@ export async function computeConversationFactsBacklogCheck(
         message: `${backlog} eligible pages without extraction. Fix: ${fixHint}`,
         details: {
           backlog,
+          completed,
+          scanned_not_extractable: nonExtractable,
           types,
           fix_hint: fixHint,
-          known_approximation:
-            'backlog counts pages with NO extraction terminal row; pages with new messages since prior extraction may show OK until next run',
+          freshness_rule: 'outcome.created_at >= page.updated_at',
         },
       };
     }
@@ -3061,7 +3076,13 @@ export async function computeConversationFactsBacklogCheck(
       name,
       status: 'ok',
       message: `${backlog} eligible page(s) below warn threshold (>10)`,
-      details: { backlog, types },
+      details: {
+        backlog,
+        completed,
+        scanned_not_extractable: nonExtractable,
+        types,
+        freshness_rule: 'outcome.created_at >= page.updated_at',
+      },
     };
   } catch (err) {
     return {

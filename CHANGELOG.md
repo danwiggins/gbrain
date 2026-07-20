@@ -2,6 +2,51 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.58.1] - 2026-07-20
+
+**Conversation backfills now stop revisiting finished pages, keep harmless parser misses separate from real extraction work, and default to the Slack and meeting material most likely to improve retrieval. Custom schema packs also receive the types they inherit from their parent packs, so doctor evaluates the schema users actually configured.**
+
+### How to use it
+
+Run a small, serial canary before a larger backfill:
+
+```bash
+gbrain extract-conversation-facts --types meeting,slack --limit 20 --workers 1 --max-cost-usd 0.25 --yes
+gbrain doctor
+```
+
+Bulk runs now default to `meeting,slack`. Email remains available through an explicit `--types email`, but routine email ingestion should use thread aggregation or the real-time fact extractor.
+
+| What happened before | What happens now |
+|---|---|
+| Checkpoint cleanup made completed pages look unfinished | A fresh terminal fact durably excludes the page before parsing or model work |
+| A successfully scanned non-conversation page stayed in the backlog | A separate scanned-not-extractable outcome closes it without claiming facts were extracted |
+| Child schema packs exposed only their leaf declarations | Parent declarations are materialized root-to-leaf, with child declarations winning |
+
+### Safe to know
+
+- Updating a page makes an older outcome stale, so appended Slack messages or meeting notes are reconsidered.
+- Parser or model failures never create a scanned-not-extractable outcome.
+- `--force` still bypasses durable outcomes for an intentional replay.
+- Schema-pack phases remain leaf-local. Extending a pack does not silently opt into a parent's model-spend phases.
+
+### Itemized changes
+
+- **Backfill selection:** terminal and non-extractable outcomes are checked before page locks, parsing, or model calls, and rechecked after locking for race safety.
+- **Doctor:** conversation backlog reports completed, scanned-not-extractable, and unfinished counts separately, using outcome freshness against the page update time.
+- **Default scope:** cycle, source audit, doctor, and CLI defaults align on `meeting,slack`; explicit single-page commands retain support for every eligible conversation type.
+- **Schema resolution:** `extends` materializes page types, link types, enrichable types, frontmatter links, filing rules, take kinds, and calibration domains child-wins.
+- **Tests:** durability after checkpoint garbage collection, stale outcomes after page edits, parser-failure safety, doctor accounting, and schema inheritance/override behavior are covered.
+
+### To take advantage of v0.42.58.1
+
+1. Upgrade gbrain and restart long-running workers.
+2. Run the 20-page canary above and inspect a sample of the new facts.
+3. If the sample is precise, rerun with a firm cost cap sized for the remaining Slack/meeting backlog.
+4. Run `gbrain schema show`, `gbrain schema stats --json`, and `gbrain doctor` to verify inherited types and backlog health.
+
+No database schema migration is required.
+
 ## [0.42.58.0] - 2026-07-20
 
 **Run a Postgres-backed brain entirely on its always-on server, even if shared configuration still points at a checkout on another computer. Autopilot now continues in database-only mode on Postgres, recovers interrupted fact extraction in bounded passes, and leaves the original source pages untouched.**

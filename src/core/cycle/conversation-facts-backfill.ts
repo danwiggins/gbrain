@@ -36,7 +36,7 @@
  *   cycle.conversation_facts_backfill.max_total_cost_usd   (5.00)
  *   cycle.conversation_facts_backfill.max_walltime_min     (20)
  *   cycle.conversation_facts_backfill.max_total_walltime_min (30)
- *   cycle.conversation_facts_backfill.types                (["conversation","meeting","slack","email"])
+ *   cycle.conversation_facts_backfill.types                ([meeting, slack])
  *
  * `.types` is the single source of truth for "enabled types" — the CLI
  * default reads from the same key (Eng-v2 A2).
@@ -49,6 +49,7 @@ import { listSources } from '../sources-ops.ts';
 import {
   runExtractConversationFactsCore,
   ALLOWED_TYPES,
+  DEFAULT_TYPES,
   type AllowedType,
   type ExtractConversationFactsResult,
 } from '../../commands/extract-conversation-facts.ts';
@@ -112,7 +113,7 @@ async function loadCfg(engine: BrainEngine): Promise<ResolvedConfig> {
     return Number.isFinite(n) && n > 0 ? n : fallback;
   };
 
-  let types: AllowedType[] = [...ALLOWED_TYPES];
+  let types: AllowedType[] = [...DEFAULT_TYPES];
   if (typesRaw) {
     try {
       const parsed = JSON.parse(typesRaw);
@@ -256,6 +257,9 @@ export async function runPhaseConversationFactsBackfill(
             pages_skipped: 0,
             pages_skipped_too_large: 0,
             pages_skipped_disappeared: 0,
+            pages_skipped_completed: 0,
+            pages_skipped_non_extractable: 0,
+            pages_marked_non_extractable: 0,
             // v0.41.15.0 (D6 + D11): new counters from the per-page lock
             // + delete-orphans-first replay safety.
             pages_lock_skipped: 0,
@@ -292,6 +296,9 @@ export async function runPhaseConversationFactsBackfill(
   const totals = {
     pages_processed: 0,
     pages_skipped: 0,
+    pages_skipped_completed: 0,
+    pages_skipped_non_extractable: 0,
+    pages_marked_non_extractable: 0,
     facts_inserted: 0,
     sources_processed: 0,
   };
@@ -299,6 +306,9 @@ export async function runPhaseConversationFactsBackfill(
     if (!r.error) totals.sources_processed++;
     totals.pages_processed += r.pages_processed;
     totals.pages_skipped += r.pages_skipped;
+    totals.pages_skipped_completed += r.pages_skipped_completed;
+    totals.pages_skipped_non_extractable += r.pages_skipped_non_extractable;
+    totals.pages_marked_non_extractable += r.pages_marked_non_extractable;
     totals.facts_inserted += r.facts_inserted;
   }
 
@@ -316,6 +326,9 @@ export async function runPhaseConversationFactsBackfill(
       sources_processed: totals.sources_processed,
       pages_processed: totals.pages_processed,
       pages_skipped: totals.pages_skipped,
+      pages_skipped_completed: totals.pages_skipped_completed,
+      pages_skipped_non_extractable: totals.pages_skipped_non_extractable,
+      pages_marked_non_extractable: totals.pages_marked_non_extractable,
       facts_inserted: totals.facts_inserted,
       spent_usd: totalSpent,
       skipped_by_brain_wide_cap: skippedByBrainWideCap,

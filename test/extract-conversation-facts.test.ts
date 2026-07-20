@@ -33,6 +33,8 @@ import {
   SEGMENT_TEXT_CHAR_LIMIT,
   MAX_PAGE_BODY_BYTES,
   TERMINAL_AUDIT_SOURCE,
+  NON_EXTRACTABLE_AUDIT_SOURCE,
+  DEFAULT_TYPES,
   PER_SEGMENT_SOURCE_PREFIX,
 } from '../src/commands/extract-conversation-facts.ts';
 
@@ -399,6 +401,120 @@ describe('runExtractConversationFactsCore', () => {
     expect(Number(terminalRows[0]?.count ?? 0)).toBe(1);
   });
 
+  test('durable terminal outcome skips completed pages after checkpoint GC', async () => {
+    await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/imessage/alice-example',
+      types: ['conversation'],
+      sleepMs: 0,
+    });
+    await engine.executeRaw(
+      `DELETE FROM op_checkpoints WHERE op = 'extract-conversation-facts'`,
+    );
+
+    const second = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/imessage/alice-example',
+      types: ['conversation'],
+      sleepMs: 0,
+    });
+    expect(second.pages_skipped_completed).toBe(1);
+    expect(second.pages_processed).toBe(0);
+    expect(second.segments_processed).toBe(0);
+  });
+
+  test('page update makes an older terminal outcome stale and eligible again', async () => {
+    await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/imessage/alice-example',
+      types: ['conversation'],
+      sleepMs: 0,
+    });
+    await engine.putPage('conversations/imessage/alice-example', {
+      type: 'conversation',
+      title: 'iMessage: Alice Example',
+      compiled_truth: SAMPLE_BODY + '\n' + [
+        fmt('Alice Example', '2024-03-17', '9:00 AM', 'new tail'),
+        fmt('Bob Demo', '2024-03-17', '9:01 AM', 'new response'),
+      ].join('\n'),
+      timeline: '',
+      frontmatter: {},
+    });
+
+    const second = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/imessage/alice-example',
+      types: ['conversation'],
+      sleepMs: 0,
+    });
+    expect(second.pages_skipped_completed).toBe(0);
+    expect(second.pages_processed).toBe(1);
+    expect(second.segments_processed).toBeGreaterThan(0);
+  });
+
+  test('records and durably skips scanned pages with no extractable segment', async () => {
+    await engine.putPage('conversations/single-message', {
+      type: 'slack',
+      title: 'Single message',
+      compiled_truth: fmt('Alice Example', '2024-03-15', '9:00 AM', 'only one'),
+      timeline: '',
+      frontmatter: {},
+    });
+    const first = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/single-message',
+      types: ['slack'],
+      sleepMs: 0,
+    });
+    expect(first.pages_marked_non_extractable).toBe(1);
+    const markers = await engine.executeRaw<{ count: string | number }>(
+      `SELECT COUNT(*) AS count FROM facts WHERE source = $1 AND source_session = $2`,
+      [
+        NON_EXTRACTABLE_AUDIT_SOURCE,
+        `${NON_EXTRACTABLE_AUDIT_SOURCE}:conversations/single-message`,
+      ],
+    );
+    expect(Number(markers[0]?.count ?? 0)).toBe(1);
+
+    await engine.executeRaw(
+      `DELETE FROM op_checkpoints WHERE op = 'extract-conversation-facts'`,
+    );
+    const second = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/single-message',
+      types: ['slack'],
+      sleepMs: 0,
+    });
+    expect(second.pages_skipped_non_extractable).toBe(1);
+    expect(second.pages_marked_non_extractable).toBe(0);
+  });
+
+  test('does not durably classify a regex miss when LLM fallback is disabled', async () => {
+    await engine.putPage('meetings/unrecognized-format', {
+      type: 'meeting',
+      title: 'Unrecognized meeting format',
+      compiled_truth: 'Alice spoke first. Bob answered later.',
+      timeline: '',
+      frontmatter: {},
+    });
+    const result = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'meetings/unrecognized-format',
+      types: ['meeting'],
+      sleepMs: 0,
+    });
+    expect(result.pages_marked_non_extractable).toBe(0);
+    const markers = await engine.executeRaw<{ count: string | number }>(
+      'SELECT COUNT(*) AS count FROM facts WHERE source = $1 AND source_markdown_slug = $2',
+      [NON_EXTRACTABLE_AUDIT_SOURCE, 'meetings/unrecognized-format'],
+    );
+    expect(Number(markers[0]?.count ?? 0)).toBe(0);
+  });
+
+  test('default bulk types are meeting and slack only', () => {
+    expect(DEFAULT_TYPES).toEqual(['meeting', 'slack']);
+  });
+
   test('B1: a swallowed insertFacts failure does NOT advance the cursor (page re-extracts next run)', async () => {
     // Regression for cursor-only-on-confirmed-write. The per-segment insert
     // is best-effort (the catch swallows + continues); pre-B1 the cursor
@@ -659,13 +775,13 @@ describe('runExtractConversationFactsCore', () => {
       sleepMs: 0,
     });
     expect(first.pages_processed).toBe(1);
-    // Re-run without force: no new segments (sinceIso > newest segment endIso).
+    // Re-run without force: durable terminal selection skips the page.
     const second = await runExtractConversationFactsCore(engine, {
       sourceId: 'default',
       slug: 'conversations/imessage/alice-example',
       sleepMs: 0,
     });
-    expect(second.pages_skipped).toBe(1);
+    expect(second.pages_skipped_completed).toBe(1);
     // Re-run with force: re-processes.
     const third = await runExtractConversationFactsCore(engine, {
       sourceId: 'default',
