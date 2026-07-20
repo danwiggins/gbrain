@@ -2,6 +2,22 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.58.3] - 2026-07-20
+
+**Budget-capped meeting extraction is retry-safe. A run that reaches its cost ceiling no longer turns unfinished rich meetings into durable zero-fact completions.**
+
+### Why
+
+The 0.42.58.2 production canary produced 121 grounded facts within its $0.25 ceiling, but the shared fact helper converted `BudgetExhausted` into an empty extraction result. The caller then wrote terminal completion markers for ten rich meetings that had received no facts. Those pages would have been skipped forever despite never completing.
+
+### What changed
+
+- `BudgetExhausted` now propagates through both chat and embedding failures so the worker stops cleanly and leaves the current page eligible for retry.
+- A fresh terminal marker with zero per-segment facts no longer closes a rich structured meeting. This narrowly repairs the ten false completions produced by 0.42.58.2 while preserving durable zero-work outcomes for Slack noise and genuinely non-extractable pages.
+- Direct and engine-wired regressions prove the budget signal survives the shared extractor and a zero-fact rich meeting is selected and completed on the next run.
+
+No database migration is required. Re-run the bounded canary after upgrading; completed pages with actual extracted facts remain skipped.
+
 ## [0.42.58.2] - 2026-07-20
 
 **Structured meeting summaries now produce grounded facts instead of being mistaken for failed chat parses. Slack machine-noise pages keep the strict non-extractable path.**

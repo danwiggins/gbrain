@@ -26,6 +26,7 @@ import type { ChatResult } from '../ai/gateway.ts';
 import { INJECTION_PATTERNS } from '../think/sanitize.ts';
 import { resolveModel } from '../model-config.ts';
 import { normalizeModelId } from '../model-id.ts';
+import { BudgetExhausted } from '../budget/budget-tracker.ts';
 import type { BrainEngine, NewFact, FactKind } from '../engine.ts';
 import { normalizeMetricLabel } from './extract-from-fence.ts';
 
@@ -185,7 +186,7 @@ export async function extractFactsFromTurn(input: ExtractInput): Promise<Extract
   } catch (err) {
     // Re-throw aborts; absorb other errors as "no extraction" — caller's
     // `put_page` backstop will still record the page itself.
-    if (isAbort(err)) throw err;
+    if (isAbort(err) || err instanceof BudgetExhausted) throw err;
     return [];
   }
 
@@ -219,7 +220,7 @@ export async function extractFactsFromTurn(input: ExtractInput): Promise<Extract
     try {
       embedding = await embedOne(factText);
     } catch (err) {
-      if (isAbort(err)) throw err;
+      if (isAbort(err) || err instanceof BudgetExhausted) throw err;
       // Gateway-down → NULL embedding; classifier still runs without
       // fast-path. (eE8 distinction.)
       embedding = null;
