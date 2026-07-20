@@ -83,6 +83,7 @@ import { getCliOptions, cliOptsToProgressOptions, maybeBackground } from '../cor
 import { loadConfig } from '../core/config.ts';
 import { runLlmFallback } from '../core/conversation-parser/llm-fallback.ts';
 import { resolveModel } from '../core/model-config.ts';
+import { throwIfAborted } from '../core/abort-check.ts';
 import { createHash } from 'crypto';
 // v0.41.15.0 (T5): worker-pool primitive + per-source-clamp wrapper +
 // per-page advisory lock + delete-orphans-first replay safety. See plan
@@ -655,7 +656,10 @@ async function deleteOrphanFactsForPage(
          WHERE source_id = $1
            AND source_markdown_slug = $2
            AND source LIKE 'cli:extract-conversation-facts%'
-           AND row_num >= $3
+           AND (
+             source = 'cli:extract-conversation-facts:terminal'
+             OR row_num >= $3
+           )
          RETURNING 1
        )
        SELECT COUNT(*)::text AS count FROM del`,
@@ -785,6 +789,17 @@ async function processPage(
   if (parseResult.timezone_warning) {
     process.stderr.write(parseResult.timezone_warning + '\n');
   }
+  const pageElapsedMs = Date.now() - state.startedAt;
+  if (state.deadlineMs > 0 && pageElapsedMs >= state.deadlineMs) {
+    state.deadlineHit.value = true;
+    return { newEndIso: null };
+  }
+  const pageDeadlineSignal = state.deadlineMs > 0
+    ? AbortSignal.timeout(Math.max(1, state.deadlineMs - pageElapsedMs))
+    : undefined;
+  const pageSignal = pageDeadlineSignal && state.signal
+    ? AbortSignal.any([state.signal, pageDeadlineSignal])
+    : (pageDeadlineSignal ?? state.signal);
   // v0.42.x — LLM fallback wiring (previously defined but never called). When
   // no built-in regex pattern matched (phase `no_match`) and the operator has
   // opted in, ask the utility-tier LLM to parse the body. The prompt returns
@@ -801,13 +816,25 @@ async function processPage(
         modelStr: state.llmFallbackModel,
         body,
         engine: state.engine,
-        signal: state.signal,
+        signal: pageSignal,
         // Thread the page's date so time-only timestamps resolve to the real
         // conversation date, not 1970-01-01. Without this the fallback's
         // messages fall below the per-page segment/checkpoint watermark, so
         // the backfill cycle never advances and re-parses the page forever.
         fallbackDate: deriveDateContext({ page }).fallbackDate,
       });
+      // The fallback is fail-open and returns null when its transport aborts.
+      // Preserve a caller cancellation as cancellation; only an internal
+      // deadline is converted into a bounded partial result below.
+      throwIfAborted(state.signal, 'extract-conversation-facts');
+      // runLlmFallback is deliberately fail-open and converts transport
+      // failures (including AbortError) to null. Check our own deadline
+      // signal after it returns so an in-flight timeout is still surfaced as
+      // a bounded partial run instead of looking like a normal parser miss.
+      if (pageDeadlineSignal?.aborted && !state.signal?.aborted) {
+        state.deadlineHit.value = true;
+        return { newEndIso: null };
+      }
       if (fb && fb.length > 0) {
         messages = fb;
         state.result.pages_llm_fallback = (state.result.pages_llm_fallback ?? 0) + 1;
@@ -816,6 +843,10 @@ async function processPage(
         );
       }
     } catch (err) {
+      if (pageDeadlineSignal?.aborted && !state.signal?.aborted) {
+        state.deadlineHit.value = true;
+        return { newEndIso: null };
+      }
       if (isAbortError(err)) throw err;
       if (err instanceof BudgetExhausted) throw err;
       process.stderr.write(
@@ -872,6 +903,18 @@ async function processPage(
     if (state.segmentLimit > 0 && segmentsThisPage >= state.segmentLimit) break;
     if (state.signal?.aborted) throw new Error('aborted');
 
+    const elapsedMs = Date.now() - state.startedAt;
+    if (state.deadlineMs > 0 && elapsedMs >= state.deadlineMs) {
+      state.deadlineHit.value = true;
+      break;
+    }
+    const deadlineSignal = state.deadlineMs > 0
+      ? AbortSignal.timeout(Math.max(1, state.deadlineMs - elapsedMs))
+      : undefined;
+    const effectiveSignal = deadlineSignal && state.signal
+      ? AbortSignal.any([state.signal, deadlineSignal])
+      : (deadlineSignal ?? state.signal);
+
     const text = renderSegmentForExtraction(page.title || page.slug, seg);
     const sessionId = `${PER_SEGMENT_SOURCE_PREFIX}:${page.slug}`;
 
@@ -882,9 +925,13 @@ async function processPage(
         sessionId,
         source: PER_SEGMENT_SOURCE_PREFIX,
         engine: state.engine,
-        abortSignal: state.signal,
+        abortSignal: effectiveSignal,
       });
     } catch (err) {
+      if (deadlineSignal?.aborted && !state.signal?.aborted) {
+        state.deadlineHit.value = true;
+        break;
+      }
       if (isAbortError(err)) throw err;
       if (err instanceof BudgetExhausted) throw err;
       // Per-segment LLM failures are best-effort; loop continues. B1: a

@@ -13,6 +13,7 @@
 
 import { describe, expect, test, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { withEnv } from './helpers/with-env.ts';
 import {
   __setChatTransportForTests,
   __setEmbedTransportForTests,
@@ -320,6 +321,7 @@ describe('runExtractConversationFactsCore', () => {
     await engine.executeRaw(`DELETE FROM pages WHERE slug LIKE 'conversations/%' OR slug LIKE 'people/alice%'`);
     // Set facts.extraction_enabled=true so kill-switch doesn't refuse.
     await engine.setConfig('facts.extraction_enabled', 'true');
+    await engine.executeRaw(`DELETE FROM config WHERE key = 'conversation_parser.llm_fallback_enabled'`);
     // Seed test pages.
     await engine.putPage('conversations/imessage/alice-example', {
       type: 'conversation',
@@ -446,6 +448,112 @@ describe('runExtractConversationFactsCore', () => {
     });
     expect(second.pages_processed).toBe(1);
     expect(second.facts_inserted).toBeGreaterThan(0);
+  });
+
+  test('an appended tail removes the old terminal before a failed retry', async () => {
+    await runExtractConversationFactsCore(engine, {
+      sourceId: 'default', slug: 'conversations/imessage/alice-example', sleepMs: 0,
+    });
+    await engine.putPage('conversations/imessage/alice-example', {
+      type: 'conversation',
+      title: 'iMessage: Alice Example',
+      compiled_truth: SAMPLE_BODY + '\n' + [
+        fmt('Alice Example', '2024-03-17', '9:00 AM', 'A new update arrived.'),
+        fmt('Bob Demo', '2024-03-17', '9:05 AM', 'Acknowledged.'),
+      ].join('\n'),
+      timeline: '',
+      frontmatter: {},
+    });
+
+    type IF = PGLiteEngine['insertFacts'];
+    const realInsertFacts: IF = engine.insertFacts.bind(engine);
+    engine.insertFacts = (async () => { throw new Error('synthetic appended-tail failure'); }) as IF;
+    try {
+      await runExtractConversationFactsCore(engine, {
+        sourceId: 'default', slug: 'conversations/imessage/alice-example', sleepMs: 0,
+      });
+    } finally {
+      engine.insertFacts = realInsertFacts;
+    }
+
+    const terminal = await engine.executeRaw<{ count: string | number }>(
+      `SELECT COUNT(*) AS count FROM facts WHERE source = $1 AND source_markdown_slug = $2`,
+      [TERMINAL_AUDIT_SOURCE, 'conversations/imessage/alice-example'],
+    );
+    expect(Number(terminal[0]?.count ?? 0)).toBe(0);
+  });
+
+  test('deadline aborts an in-flight segment and preserves it for retry', async () => {
+    __setChatTransportForTests(async (opts): Promise<ChatResult> => new Promise((_, reject) => {
+      opts.abortSignal?.addEventListener('abort', () => {
+        const error = new Error('deadline');
+        error.name = 'AbortError';
+        reject(error);
+      }, { once: true });
+    }));
+    try {
+      const result = await runExtractConversationFactsCore(engine, {
+        sourceId: 'default',
+        slug: 'conversations/imessage/alice-example',
+        sleepMs: 0,
+        deadlineMs: 25,
+      });
+      expect(result.deadline_hit).toBe(true);
+      expect(result.segments_processed).toBe(0);
+    } finally {
+      let restoredCallIndex = 0;
+      __setChatTransportForTests(async (): Promise<ChatResult> => ({
+        text: JSON.stringify({ facts: [{
+          fact: `synthetic restored fact #${++restoredCallIndex}`,
+          kind: 'event', entity: 'companies/acme-corp',
+          confidence: 1.0, notability: 'high',
+        }] }), blocks: [], stopReason: 'end',
+        usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'stub:stub', providerId: 'stub',
+      }));
+    }
+  });
+
+  test('deadline also bounds the LLM conversation-parser fallback', async () => {
+    await engine.putPage('conversations/llm-fallback-deadline', {
+      type: 'conversation',
+      title: 'Imported conversation',
+      compiled_truth: 'A narrative transcript with no recognized speaker timestamp syntax.',
+      timeline: '',
+      frontmatter: {},
+    });
+    await engine.setConfig('conversation_parser.llm_fallback_enabled', 'true');
+    __setChatTransportForTests(async (opts): Promise<ChatResult> => new Promise((_, reject) => {
+      opts.abortSignal?.addEventListener('abort', () => {
+        const error = new Error('deadline');
+        error.name = 'AbortError';
+        reject(error);
+      }, { once: true });
+    }));
+    try {
+      await withEnv({ ANTHROPIC_API_KEY: 'sk-test' }, async () => {
+        const result = await runExtractConversationFactsCore(engine, {
+          sourceId: 'default',
+          slug: 'conversations/llm-fallback-deadline',
+          sleepMs: 0,
+          deadlineMs: 25,
+        });
+        expect(result.deadline_hit).toBe(true);
+        expect(result.segments_processed).toBe(0);
+      });
+    } finally {
+      await engine.executeRaw(`DELETE FROM config WHERE key = 'conversation_parser.llm_fallback_enabled'`);
+      let restoredCallIndex = 0;
+      __setChatTransportForTests(async (): Promise<ChatResult> => ({
+        text: JSON.stringify({ facts: [{
+          fact: `synthetic fallback-restored fact #${++restoredCallIndex}`,
+          kind: 'event', entity: 'companies/acme-corp',
+          confidence: 1.0, notability: 'high',
+        }] }), blocks: [], stopReason: 'end',
+        usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'stub:stub', providerId: 'stub',
+      }));
+    }
   });
 
   test('row_num accumulator: segment 2 facts start after segment 1 (Codex C1)', async () => {

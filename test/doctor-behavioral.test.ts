@@ -196,6 +196,36 @@ describe('buildChecks — orchestrator against PGLite', () => {
     expect(withJson.map(c => c.name)).toEqual(without.map(c => c.name));
   });
 
+  test('facts extraction health counts unresolved pages and honors recovery tombstones', async () => {
+    await engine.setConfig('facts.absorb_warn_threshold', '1');
+    for (let i = 0; i < 2; i++) {
+      await engine.logIngest({
+        source_id: 'default',
+        source_type: 'facts:absorb',
+        source_ref: 'email/example-message',
+        pages_updated: [],
+        summary: 'pipeline_error: aborted',
+      });
+    }
+
+    const before = (await buildChecks(engine, []))
+      .find(c => c.name === 'facts_extraction_health');
+    expect(before?.status).toBe('warn');
+    expect(before?.message).toContain('default: 1 pipeline_error');
+
+    await engine.logIngest({
+      source_id: 'default',
+      source_type: 'facts:absorb-recovered',
+      source_ref: 'email/example-message',
+      pages_updated: [],
+      summary: 'recovered',
+    });
+    const after = (await buildChecks(engine, []))
+      .find(c => c.name === 'facts_extraction_health');
+    expect(after?.status).toBe('ok');
+    expect(after?.message).toContain('No unresolved facts extraction failures');
+  });
+
   test('returns partial check list when engine is null (no early process.exit)', async () => {
     // Pre-v0.39 the no-engine path called outputResults + process.exit
     // directly. Post-extract it returns the partial list so the wrapper

@@ -243,8 +243,9 @@ export const PHASE_SCOPE: Record<CyclePhase, PhaseScope> = {
   // fanout enforcement today (per the comment above); the phase
   // wrapper does its own multi-source loop via listSources().
   conversation_facts_backfill: 'source',
-  // Per-source (wrapper loops listSources, same as above).
-  realtime_absorb_recovery: 'source',
+  // Brain-wide: the wrapper already loops all sources. Running it in every
+  // per-source fanout job would replay the same backlog concurrently.
+  realtime_absorb_recovery: 'global',
   // v0.41.39 (#1700) — per-source (wrapper loops listSources, same as above).
   enrich_thin: 'source',
   // v0.41.20.0 SkillOpt — global (walks the skills/ directory; per-skill
@@ -430,6 +431,8 @@ export interface CycleOpts {
    * with reason `no_brain_dir` and the DB-only phases still run.
    */
   brainDir: string | null;
+  /** Persist phase transitions when invoked by a long-lived worker. */
+  progressReporter?: ProgressReporter;
   /** Whether sync should run `git pull`. Default false (cron-safe). */
   pull?: boolean;
   /**
@@ -1453,7 +1456,7 @@ export async function runCycle(
     ? (opts.sourceId ?? (await resolveSourceForDir(engine, brainDir)))
     : opts.sourceId;
 
-  const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
+  const progress = opts.progressReporter ?? createProgress(cliOptsToProgressOptions(getCliOptions()));
 
   // Decide if we need the cycle lock: any state-mutating phase in the selection.
   const needsLock = phases.some(p => NEEDS_LOCK_PHASES.has(p));

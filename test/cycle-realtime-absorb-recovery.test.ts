@@ -108,6 +108,7 @@ describe('realtime_absorb_recovery phase', () => {
     const result = await runPhaseRealtimeAbsorbRecovery(engine, {});
     expect(result.status).toBe('ok');
     expect(result.details.recovered).toBe(1);
+    expect(result.details.remaining).toBe(0);
     expect(await countFacts(engine)).toBeGreaterThan(0);
     expect(await countTombstones(engine, SLUG)).toBe(1);
   });

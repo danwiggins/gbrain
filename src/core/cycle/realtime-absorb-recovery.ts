@@ -139,6 +139,27 @@ async function loadBacklog(
   return rows.map((r) => r.source_ref);
 }
 
+async function countBacklog(engine: BrainEngine): Promise<number> {
+  const rows = await engine.executeRaw<{ n: string | number }>(
+    `SELECT COUNT(*)::text AS n
+       FROM (
+         SELECT f.source_id, f.source_ref
+           FROM ingest_log f
+          WHERE f.source_type = $1
+            AND NOT EXISTS (
+              SELECT 1 FROM ingest_log r
+               WHERE r.source_type = $2
+                 AND r.source_id = f.source_id
+                 AND r.source_ref = f.source_ref
+                 AND r.created_at >= f.created_at
+            )
+          GROUP BY f.source_id, f.source_ref
+       ) unresolved`,
+    [ABSORB_FAILURE_TYPE, ABSORB_RECOVERED_TYPE],
+  );
+  return Number(rows[0]?.n ?? 0);
+}
+
 async function tombstone(
   engine: BrainEngine,
   sourceId: string,
@@ -299,11 +320,12 @@ export async function runPhaseRealtimeAbsorbRecovery(
     }
   }
 
+  const remaining = await countBacklog(engine);
   const status: RealtimeAbsorbRecoveryPhaseResult['status'] = errors.length > 0 ? 'warn' : 'ok';
   const summary =
     `recovered ${recovered} page(s) (${factsInserted} facts), ` +
     `${pagesGone} gone, ${pagesIneligible} ineligible, ${attempted} attempted, ` +
-    `~$${tracker.totalSpent.toFixed(4)}` +
+    `~$${tracker.totalSpent.toFixed(4)}, ${remaining} remaining` +
     (deadlineHit ? ' [deadline]' : '') +
     (budgetHit ? ' [budget]' : '') +
     (extractionDisabled ? ' [extraction-disabled]' : '');
@@ -320,6 +342,7 @@ export async function runPhaseRealtimeAbsorbRecovery(
       pages_gone: pagesGone,
       pages_ineligible: pagesIneligible,
       attempted,
+      remaining,
       deadline_hit: deadlineHit,
       budget_hit: budgetHit,
       extraction_disabled: extractionDisabled,

@@ -17,7 +17,7 @@
  *   gbrain autopilot --status [--json]
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, utimesSync, unlinkSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, unlinkSync } from 'fs';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import { join } from 'path';
 import { execSync } from 'child_process';
@@ -80,6 +80,50 @@ function parseArg(args: string[], flag: string): string | undefined {
   return idx >= 0 && idx + 1 < args.length ? args[idx + 1] : undefined;
 }
 
+export interface AutopilotRepoResolution {
+  repoPath: string | null;
+  ignoredConfiguredPath: string | null;
+}
+
+/** Resolve the checkout used by filesystem phases on this host. */
+export function resolveAutopilotRepo(
+  engineKind: BrainEngine['kind'],
+  explicitRepoPath: string | undefined,
+  configuredRepoPath: string | null,
+  pathExists: (path: string) => boolean = existsSync,
+): AutopilotRepoResolution {
+  if (explicitRepoPath) {
+    if (!pathExists(explicitRepoPath)) {
+      throw new Error(`Explicit --repo path does not exist on this host: ${explicitRepoPath}`);
+    }
+    return { repoPath: explicitRepoPath, ignoredConfiguredPath: null };
+  }
+
+  if (configuredRepoPath && pathExists(configuredRepoPath)) {
+    return { repoPath: configuredRepoPath, ignoredConfiguredPath: null };
+  }
+
+  if (engineKind === 'postgres') {
+    return { repoPath: null, ignoredConfiguredPath: configuredRepoPath || null };
+  }
+
+  if (configuredRepoPath) {
+    throw new Error(`Configured sync.repo_path does not exist on this host: ${configuredRepoPath}`);
+  }
+  throw new Error('No repo path. Use --repo or run gbrain sync --repo first.');
+}
+
+async function resolveAutopilotRepoForArgs(
+  engine: BrainEngine,
+  args: string[],
+): Promise<AutopilotRepoResolution> {
+  return resolveAutopilotRepo(
+    engine.kind,
+    parseArg(args, '--repo'),
+    await engine.getConfig('sync.repo_path'),
+  );
+}
+
 function logError(phase: string, e: unknown) {
   const msg = e instanceof Error ? e.message : String(e);
   const ts = new Date().toISOString().slice(0, 19);
@@ -128,6 +172,42 @@ export function resolveGbrainCliPath(): string {
 
 export function shouldSpawnAutopilotWorker(args: string[]): boolean {
   return !args.includes('--no-worker');
+}
+
+export function isPidAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error: unknown) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+export function decideLockAcquisition(
+  lockPath: string,
+  currentPid: number,
+): { action: 'acquire' } | { action: 'exit'; holderPid: number } | { action: 'takeover'; reason: string } {
+  if (!existsSync(lockPath)) return { action: 'acquire' };
+
+  let raw = '';
+  try {
+    raw = readFileSync(lockPath, 'utf-8').trim();
+  } catch {
+    // An unreadable lock cannot prove another process is alive.
+  }
+
+  const holderPid = Number.parseInt(raw, 10);
+  const sameProcess = Number.isFinite(holderPid) && holderPid === currentPid;
+  const alive = !sameProcess && isPidAlive(holderPid);
+  if (alive) return { action: 'exit', holderPid };
+  if (!raw || !Number.isFinite(holderPid)) {
+    return { action: 'takeover', reason: 'malformed lock' };
+  }
+  if (sameProcess) {
+    return { action: 'takeover', reason: `current pid ${holderPid}` };
+  }
+  return { action: 'takeover', reason: `dead pid ${holderPid}` };
 }
 
 // ── Self-upgrade silent channel (v0.42; opt-in, supervisor-relaunch) ─────────
@@ -331,15 +411,23 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
     return;
   }
 
-  const repoPath = parseArg(args, '--repo') || await engine.getConfig('sync.repo_path');
+  let repoResolution: AutopilotRepoResolution;
+  try {
+    repoResolution = await resolveAutopilotRepoForArgs(engine, args);
+  } catch (e) {
+    console.error(e instanceof Error ? e.message : String(e));
+    process.exit(1);
+  }
+  const { repoPath, ignoredConfiguredPath } = repoResolution;
   const baseInterval = parseInt(parseArg(args, '--interval') || '300', 10);
   const jsonMode = args.includes('--json');
   const forceInline = args.includes('--inline');
   const noWorker = !shouldSpawnAutopilotWorker(args);
 
-  if (!repoPath) {
-    console.error('No repo path. Use --repo or run gbrain sync --repo first.');
-    process.exit(1);
+  if (ignoredConfiguredPath) {
+    console.warn(
+      `[autopilot] sync.repo_path is not present on this host; continuing checkoutless: ${ignoredConfiguredPath}`,
+    );
   }
 
   // Lock file to prevent concurrent instances (#14).
@@ -351,19 +439,18 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
   const lockPath = gbrainHomePath('autopilot.lock');
   try {
     mkdirSync(gbrainHomePath(), { recursive: true });
-    if (existsSync(lockPath)) {
-      const stat = require('fs').statSync(lockPath);
-      const ageMinutes = (Date.now() - stat.mtimeMs) / 60000;
-      if (ageMinutes < 10) {
-        console.error('Another autopilot instance is running (lock file is fresh). Exiting.');
-        process.exit(0);
-      }
-      console.log('Stale lock file found (>10 min). Taking over.');
+    const decision = decideLockAcquisition(lockPath, process.pid);
+    if (decision.action === 'exit') {
+      console.error(`Another autopilot instance is running (pid ${decision.holderPid}). Exiting.`);
+      process.exit(0);
+    }
+    if (decision.action === 'takeover') {
+      console.log(`Stale autopilot lock found (${decision.reason}). Taking over.`);
     }
     writeFileSync(lockPath, String(process.pid));
   } catch { /* best-effort */ }
 
-  console.log(`Autopilot starting. Repo: ${repoPath}, interval: ${baseInterval}s`);
+  console.log(`Autopilot starting. Repo: ${repoPath ?? '(checkoutless)'}, interval: ${baseInterval}s`);
 
   // Mode resolution: Minions dispatch when the user has opted in AND the
   // worker daemon can actually run (Postgres only; PGLite's exclusive file
@@ -505,10 +592,6 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
   while (!stopping) {
     const cycleStart = Date.now();
     let cycleOk = true;
-
-    // Refresh the lock mtime so another cron-fired autopilot doesn't
-    // declare the instance stale after 10 minutes (Codex C).
-    try { utimesSync(lockPath, new Date(), new Date()); } catch { /* best-effort */ }
 
     // DB health check (reconnect if needed).
     //
@@ -819,7 +902,7 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
           embedKeyCfg[field] = await engine.getConfig(field);
         }
         const ctx = {
-          repoPath,
+          repoPath: repoPath ?? undefined,
           embeddingModel,
           embeddingProviderConfigured: embeddingProviderConfigured(embeddingModel, (envVar) => {
             const cfgField = HOSTED_EMBED_KEY_CONFIG[envVar];
@@ -1115,7 +1198,7 @@ function detectOpenClaw(): { detected: boolean; bootstrapCandidates: string[] } 
   return { detected: signal, bootstrapCandidates: existing };
 }
 
-function writeWrapperScript(repoPath: string): string {
+function writeWrapperScript(repoPath: string | null): string {
   const home = process.env.HOME || '';
   const gbrainDir = join(home, '.gbrain');
   mkdirSync(gbrainDir, { recursive: true });
@@ -1123,6 +1206,8 @@ function writeWrapperScript(repoPath: string): string {
   // Wrapper sources the user's shell profile for API keys so nothing is
   // baked into plist/crontab/systemd unit files (#2).
   const wrapperPath = join(gbrainDir, 'autopilot-run.sh');
+  const hasRepo = repoPath !== null;
+  repoPath = repoPath ?? '';
   const gbrainPath = resolveGbrainCliPath();
   const safeRepoPath = repoPath.replace(/'/g, "'\\''");
   const safeGbrainPath = gbrainPath.replace(/'/g, "'\\''");
@@ -1135,17 +1220,25 @@ function writeWrapperScript(repoPath: string): string {
 # OPENAI/ANTHROPIC keys exported in zshenv reach autopilot.
 [ -f ~/.zshenv ] && source ~/.zshenv 2>/dev/null
 source ~/.zshrc 2>/dev/null || source ~/.bashrc 2>/dev/null || true
-exec '${safeGbrainPath}' autopilot --repo '${safeRepoPath}'
+exec '${safeGbrainPath}' autopilot${hasRepo ? ` --repo '${safeRepoPath}'` : ''}
 `;
   writeFileSync(wrapperPath, wrapper, { mode: 0o755 });
   return wrapperPath;
 }
 
 async function installDaemon(engine: BrainEngine, args: string[]) {
-  const repoPath = parseArg(args, '--repo') || await engine.getConfig('sync.repo_path');
-  if (!repoPath) {
-    console.error('No repo path. Use --repo or run gbrain sync --repo first.');
+  let repoResolution: AutopilotRepoResolution;
+  try {
+    repoResolution = await resolveAutopilotRepoForArgs(engine, args);
+  } catch (e) {
+    console.error(e instanceof Error ? e.message : String(e));
     process.exit(1);
+  }
+  const { repoPath, ignoredConfiguredPath } = repoResolution;
+  if (ignoredConfiguredPath) {
+    console.warn(
+      `[autopilot] sync.repo_path is not present on this host; installing checkoutless: ${ignoredConfiguredPath}`,
+    );
   }
 
   const forcedTarget = parseArg(args, '--target') as InstallTarget | undefined;
@@ -1206,7 +1299,7 @@ export function generateLaunchdPlist(wrapperPath: string, home: string): string 
 </plist>`;
 }
 
-function installLaunchd(wrapperPath: string, home: string, repoPath: string) {
+function installLaunchd(wrapperPath: string, home: string, repoPath: string | null) {
   const plist = generateLaunchdPlist(wrapperPath, home);
 
   try {
@@ -1215,7 +1308,7 @@ function installLaunchd(wrapperPath: string, home: string, repoPath: string) {
     writeFileSync(plistPath(), plist);
     execSync(`launchctl load "${plistPath()}"`, { stdio: 'pipe' });
     console.log('Installed launchd service: com.gbrain.autopilot');
-    console.log(`  Repo: ${repoPath}`);
+    console.log(`  Repo: ${repoPath ?? '(checkoutless)'}`);
     console.log(`  Log: ~/.gbrain/autopilot.log`);
     console.log('  Uninstall: gbrain autopilot --uninstall');
   } catch (e: unknown) {
@@ -1314,7 +1407,7 @@ export function migrateSystemdUnitToRestartAlways(): { rewritten: boolean; reaso
   }
 }
 
-function installSystemd(wrapperPath: string, repoPath: string) {
+function installSystemd(wrapperPath: string, repoPath: string | null) {
   const unit = generateSystemdUnit(wrapperPath);
   try {
     const unitPath = systemdUnitPath();
@@ -1323,7 +1416,7 @@ function installSystemd(wrapperPath: string, repoPath: string) {
     execSync('systemctl --user daemon-reload', { stdio: 'pipe', timeout: 10_000 });
     execSync('systemctl --user enable --now gbrain-autopilot.service', { stdio: 'pipe', timeout: 15_000 });
     console.log('Installed systemd user service: gbrain-autopilot.service');
-    console.log(`  Repo: ${repoPath}`);
+    console.log(`  Repo: ${repoPath ?? '(checkoutless)'}`);
     console.log('  Log: ~/.gbrain/autopilot.log');
     console.log('  Uninstall: gbrain autopilot --uninstall');
   } catch (e: unknown) {
@@ -1336,7 +1429,7 @@ function installSystemd(wrapperPath: string, repoPath: string) {
 function installEphemeralContainer(
   wrapperPath: string,
   home: string,
-  repoPath: string,
+  repoPath: string | null,
   opts: { injectBootstrap: boolean; noInject: boolean },
 ) {
   // Write a start script the agent's bootstrap can source on every container start.
@@ -1353,7 +1446,7 @@ echo \$! > ~/.gbrain/autopilot.pid
   writeFileSync(scriptPath, script, { mode: 0o755 });
 
   console.log('Ephemeral container detected (Render / Railway / Fly / Docker).');
-  console.log(`Repo: ${repoPath}`);
+  console.log(`Repo: ${repoPath ?? '(checkoutless)'}`);
   console.log(`Start script: ${scriptPath}`);
   console.log('');
   console.log('Crontab is unreliable here (wiped on deploy). Add ONE LINE to your');

@@ -336,6 +336,31 @@ Bad values surface at `gbrain doctor` startup with a paste-ready fix
 retry wrap is engine-level, but PGLite has no pooler so retries never
 fire in practice.
 
+**Running a Postgres brain on a VPS while `sync.repo_path` still points at
+a checkout on another machine?** Install or restart the VPS daemon without a
+repo argument:
+
+```bash
+gbrain autopilot --install
+```
+
+For Postgres/Supabase, a configured checkout that does not exist on the current
+host now produces a warning and autopilot continues checkoutless. Database-only
+maintenance still runs; filesystem phases skip until a same-host checkout is
+available. An explicit missing `--repo` remains an error, and PGLite still
+requires a local checkout. Autopilot also runs one brain-wide bounded recovery
+pass for unresolved `facts:absorb` failures instead of racing the same backlog
+once per source. To inspect or run that pass directly:
+
+```bash
+gbrain dream --phase realtime_absorb_recovery --json
+```
+
+The recovery defaults to 25 pages, $0.25, and 240 seconds per cycle and reports
+the remaining unresolved page count. `gbrain doctor` counts distinct unresolved
+pages (later recovery tombstones clear recovered history), while timed-out
+Minion cycle jobs name their last persisted `cycle.<phase>` in the error.
+
 **Dream cycle losing ~150 link rows per run with `'No database
 connection: connect() has not been called'` errors in the log?** v0.41.27.0
 makes the retry layer self-heal on a nulled-out database singleton. A
