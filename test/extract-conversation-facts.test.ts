@@ -602,6 +602,39 @@ describe('runExtractConversationFactsCore', () => {
     expect(result.facts_inserted).toBeGreaterThan(0);
   });
 
+  test('retries a rich meeting with a fresh terminal marker but zero extracted facts', async () => {
+    const slug = 'meetings/zero-fact-terminal';
+    await engine.putPage(slug, {
+      type: 'meeting',
+      title: 'Zero fact terminal meeting',
+      compiled_truth: `## Overview\n${'Grounded study evidence and interpretation. '.repeat(20)}\n\n## Action items\nReview the controls.`,
+      timeline: '',
+      frontmatter: { date: '2026-07-19' },
+    });
+    await engine.executeRaw(
+      `INSERT INTO facts (
+         source_id, fact, kind, source, source_session,
+         source_markdown_slug, row_num, valid_from
+       ) VALUES ($1, $2, 'fact', $3, $4, $5, 0, now())`,
+      [
+        'default',
+        'EXTRACTION_COMPLETE',
+        TERMINAL_AUDIT_SOURCE,
+        `${TERMINAL_AUDIT_SOURCE}:${slug}`,
+        slug,
+      ],
+    );
+    const result = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug,
+      types: ['meeting'],
+      sleepMs: 0,
+    });
+    expect(result.pages_skipped_completed).toBe(0);
+    expect(result.pages_processed).toBe(1);
+    expect(result.facts_inserted).toBeGreaterThan(0);
+  });
+
   test('replaces long-form CLI facts when a structured meeting page changes', async () => {
     const slug = 'meetings/structured-refresh';
     const write = (suffix: string) => engine.putPage(slug, {

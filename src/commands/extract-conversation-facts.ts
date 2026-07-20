@@ -736,8 +736,16 @@ async function findFreshExtractionOutcomes(
   pages: readonly Page[],
 ): Promise<Map<string, DurableExtractionOutcome>> {
   if (pages.length === 0) return new Map();
-  const rows = await engine.executeRaw<{ slug: string; source: string }>(
-    `SELECT p.slug, f.source
+  const rows = await engine.executeRaw<{ slug: string; source: string; has_extracted_facts: boolean }>(
+    `SELECT p.slug, f.source,
+            EXISTS (
+              SELECT 1
+                FROM facts extracted
+               WHERE extracted.source_id = p.source_id
+                 AND extracted.source_markdown_slug = p.slug
+                 AND extracted.source = $5
+                 AND extracted.expired_at IS NULL
+            ) AS has_extracted_facts
        FROM pages p
        JOIN facts f
          ON f.source_id = p.source_id
@@ -754,11 +762,25 @@ async function findFreshExtractionOutcomes(
       pages.map((page) => page.slug),
       [TERMINAL_AUDIT_SOURCE, NON_EXTRACTABLE_AUDIT_SOURCE],
       TERMINAL_AUDIT_SOURCE,
+      PER_SEGMENT_SOURCE_PREFIX,
     ],
   );
+  const pageBySlug = new Map(pages.map((page) => [page.slug, page]));
   const outcomes = new Map<string, DurableExtractionOutcome>();
   for (const row of rows) {
     if (outcomes.has(row.slug)) continue;
+    const page = pageBySlug.get(row.slug);
+    if (
+      row.source === TERMINAL_AUDIT_SOURCE &&
+      !row.has_extracted_facts &&
+      page &&
+      splitLongFormMeeting(page, readPageBody(page)).length > 0
+    ) {
+      // v0.42.58.2 could swallow BudgetExhausted inside the shared fact
+      // extractor, then write terminal success with zero facts. A rich
+      // structured meeting in that state is unfinished and must be retried.
+      continue;
+    }
     outcomes.set(
       row.slug,
       row.source === TERMINAL_AUDIT_SOURCE ? 'complete' : 'non_extractable',
