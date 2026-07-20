@@ -724,6 +724,7 @@ function logLockBusyRateLimited(sourceId: string, slug: string): void {
 }
 
 type DurableExtractionOutcome = 'complete' | 'non_extractable';
+type FreshExtractionOutcome = DurableExtractionOutcome | 'retry_zero_fact';
 
 /**
  * Return durable outcomes that are at least as new as the page itself.
@@ -734,7 +735,7 @@ async function findFreshExtractionOutcomes(
   engine: BrainEngine,
   sourceId: string,
   pages: readonly Page[],
-): Promise<Map<string, DurableExtractionOutcome>> {
+): Promise<Map<string, FreshExtractionOutcome>> {
   if (pages.length === 0) return new Map();
   const rows = await engine.executeRaw<{ slug: string; source: string; has_extracted_facts: boolean }>(
     `SELECT p.slug, f.source,
@@ -766,7 +767,7 @@ async function findFreshExtractionOutcomes(
     ],
   );
   const pageBySlug = new Map(pages.map((page) => [page.slug, page]));
-  const outcomes = new Map<string, DurableExtractionOutcome>();
+  const outcomes = new Map<string, FreshExtractionOutcome>();
   for (const row of rows) {
     if (outcomes.has(row.slug)) continue;
     const page = pageBySlug.get(row.slug);
@@ -779,6 +780,7 @@ async function findFreshExtractionOutcomes(
       // v0.42.58.2 could swallow BudgetExhausted inside the shared fact
       // extractor, then write terminal success with zero facts. A rich
       // structured meeting in that state is unfinished and must be retried.
+      outcomes.set(row.slug, 'retry_zero_fact');
       continue;
     }
     outcomes.set(
@@ -1486,14 +1488,23 @@ export async function runExtractConversationFactsCore(
      */
     const processPageWithLock = async (page: Page): Promise<void> => {
       const lockId = extractConversationFactsLockId(sourceId, page.slug);
+      const pageCpKey = cpMapKey(sourceId, page.slug);
 
       let sinceIso: string | undefined;
       // Per-page resume: --force clears prior entries; normal path uses
       // the latest endIso for this (sourceId, slug) from the shared map.
       if (opts.force) {
-        state.cpMap.delete(cpMapKey(sourceId, page.slug));
+        state.cpMap.delete(pageCpKey);
+      } else {
+        const fresh = await findFreshExtractionOutcomes(engine, sourceId, [page]);
+        if (fresh.get(page.slug) === 'retry_zero_fact') {
+          // 0.42.58.2 advanced the per-page checkpoint before writing its
+          // false zero-fact terminal. Reopening the terminal without clearing
+          // that checkpoint still filters every long-form unit as old work.
+          state.cpMap.delete(pageCpKey);
+        }
       }
-      const checkpointed = state.cpMap.get(cpMapKey(sourceId, page.slug)) ?? null;
+      const checkpointed = state.cpMap.get(pageCpKey) ?? null;
       sinceIso = pickLaterIso(checkpointed?.endIso ?? null, opts.sinceIso);
 
       try {
@@ -1510,7 +1521,10 @@ export async function runExtractConversationFactsCore(
                 [page],
               );
               const outcome = fresh.get(page.slug);
-              if (outcome && durableOutcomeStillApplies(page, outcome)) {
+              if (outcome === 'retry_zero_fact') {
+                state.cpMap.delete(pageCpKey);
+                sinceIso = opts.sinceIso;
+              } else if (outcome && durableOutcomeStillApplies(page, outcome)) {
                 recordDurableOutcomeSkip(state, outcome);
                 return { newEndIso: null };
               }
@@ -1595,6 +1609,7 @@ export async function runExtractConversationFactsCore(
             claimable = claimable.filter((page) => {
               const outcome = fresh.get(page.slug);
               if (!outcome) return true;
+              if (outcome === 'retry_zero_fact') return true;
               if (!durableOutcomeStillApplies(page, outcome)) return true;
               recordDurableOutcomeSkip(state, outcome);
               return false;

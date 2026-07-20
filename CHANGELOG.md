@@ -2,6 +2,18 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.58.4] - 2026-07-20
+
+**Zero-fact meeting recovery now clears the stale per-page resume checkpoint as well as reopening the false terminal outcome.**
+
+The first 0.42.58.3 live canary correctly selected the ten meetings falsely completed by 0.42.58.2, but their old checkpoints filtered every long-form unit before model work. The run safely spent $0 and wrote no facts, exposing that both pieces of state must be repaired together.
+
+- The selector emits an explicit retry outcome for a rich meeting with a fresh terminal marker and no live extracted facts.
+- That outcome keeps the page claimable and clears only its matching resume entry before extraction.
+- The regression now seeds both the false terminal and a checkpoint newer than the meeting, proving the meeting is actually reprocessed rather than merely selected.
+
+No database migration is required. Normal partial pages keep their checkpoints; only the narrow 0.42.58.2 false-completion signature is reset.
+
 ## [0.42.58.3] - 2026-07-20
 
 **Budget-capped meeting extraction is retry-safe. A run that reaches its cost ceiling no longer turns unfinished rich meetings into durable zero-fact completions.**
