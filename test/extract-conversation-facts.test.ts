@@ -15,6 +15,7 @@ import { describe, expect, test, beforeAll, afterAll, beforeEach } from 'bun:tes
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { withEnv } from './helpers/with-env.ts';
 import type { Page } from '../src/core/types.ts';
+import { recordCompleted } from '../src/core/op-checkpoint.ts';
 import {
   __setChatTransportForTests,
   __setEmbedTransportForTests,
@@ -36,6 +37,7 @@ import {
   LONG_FORM_MEETING_CHUNK_CHARS,
   MAX_PAGE_BODY_BYTES,
   TERMINAL_AUDIT_SOURCE,
+  CHECKPOINT_OP,
   NON_EXTRACTABLE_AUDIT_SOURCE,
   DEFAULT_TYPES,
   PER_SEGMENT_SOURCE_PREFIX,
@@ -623,6 +625,14 @@ describe('runExtractConversationFactsCore', () => {
         `${TERMINAL_AUDIT_SOURCE}:${slug}`,
         slug,
       ],
+    );
+    await recordCompleted(
+      engine,
+      {
+        op: CHECKPOINT_OP,
+        fingerprint: extractConversationFactsFingerprint({ sourceId: 'default' }),
+      },
+      [encodeCheckpointEntry('default', slug, '2026-07-19T23:59:59.000Z', 1)],
     );
     const result = await runExtractConversationFactsCore(engine, {
       sourceId: 'default',
