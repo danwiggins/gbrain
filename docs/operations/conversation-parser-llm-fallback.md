@@ -30,6 +30,36 @@ The setting affects conversation fact extraction. It does not make the
 synchronous `conversation-parser scan` command call a model, and it does not
 enable the separate LLM polish scaffold.
 
+## Select the utility model and run a canary
+
+Inspect the model routing before enabling a production run:
+
+```bash
+gbrain models
+```
+
+The fallback uses the resolved `utility` tier. Override that tier when the
+brain should use a different configured provider or model:
+
+```bash
+gbrain config set models.tier.utility <provider:model>
+```
+
+Start with one known unmatched page and an explicit cost cap:
+
+```bash
+gbrain extract-conversation-facts \
+  --source-id <source-id> \
+  --slug <conversation-slug> \
+  --max-cost-usd 1
+```
+
+Do not add `--dry-run` to this canary. Dry runs deliberately stop before the
+fallback boundary, so they cannot prove provider routing or model output.
+Success emits the per-page fallback log described under
+[Operator visibility](#operator-visibility). After the canary, remove `--slug`
+to process the source normally.
+
 ## When the fallback runs
 
 For each eligible conversation page, extraction:

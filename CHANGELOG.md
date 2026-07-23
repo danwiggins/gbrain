@@ -18,6 +18,7 @@ All notable changes to GBrain will be documented in this file.
 - Added an operator and maintainer guide covering the privacy gate, dispatch boundary, data sent to the model, date and cache semantics, failure behavior, observability, and focused test surface.
 
 No schema migrations.
+Contributed by @danwiggins.
 
 ## [0.42.64.0] - 2026-07-20
 
