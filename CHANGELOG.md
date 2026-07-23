@@ -2,6 +2,32 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.64.2] - 2026-07-23
+
+**Normalized Slack Markdown now extracts conversation messages without using
+the LLM fallback.**
+
+### Added
+
+- **Native normalized Slack parsing.** The conversation parser recognizes bold
+  speaker names followed by a valid 24-hour time, a dash separator, and message
+  text. Unicode em dash, Unicode en dash, and ASCII hyphen separators are
+  supported. Page dates, Markdown date headings, and multi-line message bodies
+  flow through the existing deterministic parser.
+- **Continuation-aware scoring with a false-positive guard.** Distinctive
+  multi-line formats can score continuation text separately after two anchors,
+  or when the first non-blank line is an anchor. One stray schedule-like line in
+  a prose page still falls below the global acceptance floor.
+- **Stricter built-in validation.** Pattern startup checks now reject invalid
+  lower, upper, and non-integer capture-group indexes, including `text_group`.
+
+### Documentation
+
+- Added a maintainer guide for parser data flow, scoring, dates, timezones,
+  multi-line messages, fixtures, and safe built-in format additions.
+
+No schema migrations. Contributed by @danwiggins.
+
 ## [0.42.64.0] - 2026-07-20
 
 ### Fixed
