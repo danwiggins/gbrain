@@ -286,7 +286,7 @@ jobs:
       - name: Require Windows shell smoke
         env:
           WINDOWS_RESULT: ${{ needs.windows-shell-smoke.result }}
-        run: test $WINDOWS_RESULT = success
+        run: test "$WINDOWS_RESULT" = success
 
       - name: Aggregate result
         run: |
