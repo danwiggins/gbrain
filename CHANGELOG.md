@@ -10,10 +10,10 @@ Git for Windows previously converted tracked shell scripts to CRLF because the r
 
 ### Itemized changes
 
-- **Checkout policy:** refreshes every workflow's checkout action to the immutable v4.4.0 commit required by the release audit.
+- **Checkout policy:** pins every workflow's checkout action to the immutable v4.4.0 commit, keeping CI dependencies reproducible.
 - **Line endings:** declares every tracked `.sh` file as text with LF endings.
 - **Windows CI:** verifies effective Git attributes and runs `bun run test -- --dry-run` through the same package script contributors use.
-- **Pass-cache integrity:** requires the Windows smoke before writing a `ci-pass-*` marker and from the existing `test-status` umbrella, including on cache hits.
+- **Pass-cache integrity:** adds the Windows smoke to both the `ci-pass-*` write gate and the existing `test-status` umbrella, including on cache hits.
 - **Documentation:** adds the bounded Windows checkout and typecheck path to the testing guide.
 
 No database migration or user data change is required.
