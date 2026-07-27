@@ -9,7 +9,7 @@ bun install
 bun test
 ```
 
-Requires Bun 1.0+.
+Requires Bun 1.3.10+ (CI pins 1.3.13).
 
 ## Project structure
 
@@ -53,10 +53,10 @@ docs/                     Architecture docs
 
 ```bash
 # Inner edit loop (~85s on a Mac dev box, 3700+ unit tests)
-bun run test                      # parallel 8-shard fan-out + serial post-pass
+bun run test                      # parallel fan-out (default 4 shards) + serial post-pass
 bun test test/markdown.test.ts    # specific unit test
 
-# Pre-push gate (matches what CI runs on shard 1 + typecheck)
+# Pre-push gate (matches CI's dedicated `verify` job — full check battery + typecheck)
 bun run verify                    # privacy + jsonb + progress + test-isolation + wasm + admin-build + resolver + typecheck
 
 # Pre-merge sanity (everything CI runs)
@@ -90,8 +90,8 @@ trailing-newline and exports-count checks.
 
 ### Writing tests that survive the parallel loop
 
-`bun run test` shards 92+ unit-test files across 8 worker processes. Files in the
-same shard share a process, so process-global state leaks between them. Four
+`bun run test` shards 900+ unit-test files across worker processes (default 4).
+Files in the same shard share a process, so process-global state leaks between them. Four
 lint rules (`scripts/check-test-isolation.sh`, R1-R4) enforce isolation:
 
 | Rule | What it bans | Fix |
@@ -138,7 +138,8 @@ process-global). Files using `withEnv` stay outside the future
 When to quarantine instead of fix: rename to `*.serial.test.ts` if the file
 uses `mock.module(...)`, is genuinely env-coupled (module-load env readers +
 ESM caching defeat dynamic-import-after-env tricks), or intentionally shares
-state across `it()` boundaries. Quarantine count cap: 10 (informational).
+state across `it()` boundaries. The quarantine currently holds ~75 `*.serial.test.ts`
+files (informational — treat it as debt to shrink, not a hard cap).
 
 Files that violated these rules at the v0.26.7 baseline are listed in
 `scripts/check-test-isolation.allowlist`. **The allow-list MUST shrink over
@@ -148,7 +149,7 @@ time** ... never add new entries. v0.26.8 (env sweep) and v0.26.9 (PGLite sweep
 ### Local CI gate (recommended before pushing, v0.23.1+)
 
 ```bash
-bun run ci:local         # full gate: gitleaks + unit + ALL 29 E2E files (sequential)
+bun run ci:local         # full gate: gitleaks + unit + ALL E2E files (sequential)
 bun run ci:local:diff    # gate with diff-aware E2E selector
 bun run ci:select-e2e    # print which E2E files the selector would run
 ```
@@ -160,7 +161,7 @@ E2E after the first cold pull). Requires Docker (Docker Desktop, OrbStack, or
 Colima) and `gitleaks` on host (`brew install gitleaks`). Override the postgres
 host port with `GBRAIN_CI_PG_PORT=5435 bun run ci:local` if 5434 collides.
 
-Fail-closed selector: an unmapped `src/` change runs all 29 E2E files. Hand-tune
+Fail-closed selector: an unmapped `src/` change runs all E2E files. Hand-tune
 narrower mappings via `scripts/e2e-test-map.ts`.
 
 ## Building
