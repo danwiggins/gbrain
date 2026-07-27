@@ -191,7 +191,7 @@ scaffold the bundled skills into it:
 
 ```bash
 cd /path/to/agent/workspace
-gbrain skillpack scaffold --all       # copy 43 curated skills + RESOLVER.md
+gbrain skillpack scaffold --all       # copy 53 curated skills + RESOLVER.md
 ```
 
 Scaffolded skills are first-class files in your repo. Edit freely; re-running scaffold

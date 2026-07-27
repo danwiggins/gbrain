@@ -31,14 +31,16 @@ Two equivalent paths:
 
 Both must pass. Do not ship with failing E2E tests. Do not skip E2E tests.
 
-**Always run typecheck before pushing.** `bun test` (the bun runner)
-skips TypeScript type checking — it only enforces runtime behavior.
-Three ways to actually gate on types:
+**Always run typecheck before pushing.** Both `bun test` and `bun run test`
+(the npm script, which is `bash scripts/run-unit-parallel.sh` — parallel unit
+shards + a serial pass only) skip TypeScript type checking; they enforce runtime
+behavior, NOT types or the pre-check battery. Three ways to actually gate on types:
 
-1. `bun run test` (npm script in `package.json`) — includes `bun run typecheck`
-   plus the four shell pre-checks (`check-jsonb-pattern.sh`,
-   `check-progress-to-stdout.sh`, `check-trailing-newline.sh`,
-   `check-wasm-embedded.sh`) before the runner. Use this mid-branch.
+1. `bun run verify` (`scripts/run-verify-parallel.sh`) — the real typecheck +
+   checks gate: `bun run typecheck` plus the full `check:*` battery (privacy,
+   jsonb, progress, trailing-newline, wasm, test-isolation, …), fanned out in
+   parallel. This is what CI runs in its dedicated `verify` job. Use this
+   mid-branch and before pushing. Note `bun run test` does NOT typecheck.
 2. `bun run typecheck` — `tsc --noEmit` standalone. Fast (~5s on this repo).
 3. `bun run ci:local` — the full local CI gate from Path A.
 
