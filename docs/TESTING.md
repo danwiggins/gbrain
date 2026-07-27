@@ -17,6 +17,18 @@ Seven test command tiers, each with a clear scope:
 | `bun run test:e2e` | Real Postgres E2E. Requires Docker + `DATABASE_URL`. Sequential. | ~5-10min | Pre-ship; nightly. |
 | `bun run check:all` | The historical pre-check scripts (22, chained sequentially in package.json). Overlaps `verify` heavily but is NOT a superset — `verify`'s `CHECKS` array in `scripts/run-verify-parallel.sh` (~30 entries incl. typecheck) is the authoritative gate; `check:all` keeps a few local-only extras (trailing-newline, exports-count, no-legacy-getconnection). | ~10s | Local-only sweep for the extras. |
 
+### Windows checkout smoke
+
+After a fresh Windows checkout, run the bounded package-entrypoint check before the full suite:
+
+```powershell
+git check-attr text eol -- scripts/run-unit-parallel.sh
+bun run test -- --dry-run
+bun run typecheck
+```
+
+The attribute output must report `text: set` and `eol: lf`. The dry-run lists each unit shard without executing tests; CI runs this exact package entry point on `windows-latest`, and `test-status` cannot pass unless it succeeds.
+
 ### CI vs local: intentionally divergent file sets
 
 - **CI matrix** (`.github/workflows/test.yml`) runs `scripts/test-shard.sh` across 10 matrix shards partitioned by weight-aware LPT bin-packing (`scripts/sharding.ts`) and INCLUDES `*.slow.test.ts` (the two outlier slow files run as dedicated jobs alongside the matrix). CI EXCLUDES `*.serial.test.ts` from the shards and runs them in a dedicated job via `bun run test:serial`, one bun process per file — keeping serial files out of the shard processes is what preserves the `mock.module` quarantine (a top-level mock in one file leaks into every other file sharing its process). `bun run verify` gets its own job too. CI is the ground truth for "did everything pass."

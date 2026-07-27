@@ -1,0 +1,2 @@
+# Shell entrypoints must survive Git for Windows checkouts without CRLF.
+*.sh text eol=lf
