@@ -2,6 +2,22 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.58.6] - 2026-07-27
+
+**Windows contributors can now reach the normal unit-test entry point after a fresh checkout.**
+
+Git for Windows previously converted tracked shell scripts to CRLF because the repository did not declare their line-ending contract. Bash then failed on carriage returns before the test runner could parse an argument or list a shard.
+
+### Itemized changes
+
+- **Checkout policy:** pins every workflow's checkout action to the immutable v4.4.0 commit, keeping CI dependencies reproducible.
+- **Line endings:** declares every tracked `.sh` file as text with LF endings.
+- **Windows CI:** verifies effective Git attributes and runs `bun run test -- --dry-run` through the same package script contributors use.
+- **Pass-cache integrity:** adds the Windows smoke to both the `ci-pass-*` write gate and the existing `test-status` umbrella, including on cache hits.
+- **Documentation:** adds the bounded Windows checkout and typecheck path to the testing guide.
+
+No database migration or user data change is required.
+
 ## [0.42.58.5] - 2026-07-20
 
 **Normalized Slack markdown is parsed deterministically instead of relying on a giant LLM JSON response.**
