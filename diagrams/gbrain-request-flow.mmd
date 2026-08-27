@@ -1,0 +1,16 @@
+flowchart LR
+    Repo[Markdown brain repos] --> Sync[Sync and parse]
+    Sync --> Engine{Brain engine}
+    Engine -->|default| PGLite[(PGLite)]
+    Engine -->|shared or large| Postgres[(Postgres and pgvector)]
+    Agent[AI agent or operator] --> Surface[CLI or MCP]
+    Surface --> Ops[Contract-first operations]
+    Ops --> Search[Hybrid retrieval]
+    Ops --> Graph[Typed graph traversal]
+    PGLite --> Search
+    Postgres --> Search
+    PGLite --> Graph
+    Postgres --> Graph
+    Search --> Synthesis[Synthesis and gap analysis]
+    Graph --> Synthesis
+    Synthesis --> Answer[Cited answer]
