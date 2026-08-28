@@ -2,6 +2,21 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.47.2.0] - 2026-08-27
+
+Developers and operators can now trace a request from the CLI or MCP surface
+through configuration, storage, and retrieval without reverse-engineering the
+repository layout.
+
+### Added
+- A compact request-flow diagram with Mermaid source plus SVG, PNG, and editable
+  Excalidraw artifacts.
+
+### Changed
+- Clarified the README's core-package map, end-to-end request path, and pointers
+  to deeper architecture and operations references.
+- Refreshed the generated full documentation bundle to match the README.
+
 ## [0.46.35.0] - 2026-08-27
 
 **The maintainer train: 31 red-proven fixes, every one adversarially verified.**
