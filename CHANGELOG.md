@@ -16,6 +16,20 @@ repository layout.
 - Clarified the README's core-package map, end-to-end request path, and pointers
   to deeper architecture and operations references.
 - Refreshed the generated full documentation bundle to match the README.
+
+### To take advantage of v0.47.5.0
+
+**Say to your agent:** *"Walk me through gbrain's architecture"* — *"Explain how
+a request flows from the CLI or MCP surface to a cited answer."* Your agent
+reads the README's Architecture section and
+`diagrams/gbrain-request-flow.mmd` — no skill or command backs this; it is
+documentation.
+
+Or by hand:
+```bash
+gbrain upgrade        # docs-only release — no migration, nothing to run
+```
+
 ## [0.47.3.0] - 2026-08-27
 
 **Wave L: the wave-k close-out.** Three held-back items from the wave-k triage,

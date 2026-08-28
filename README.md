@@ -427,6 +427,10 @@ flowchart LR
 Rendered copies: [SVG](diagrams/gbrain-request-flow.svg) ·
 [PNG](diagrams/gbrain-request-flow.png) ·
 [editable Excalidraw](diagrams/gbrain-request-flow.excalidraw).
+The Mermaid block above must stay synchronized with
+[`diagrams/gbrain-request-flow.mmd`](diagrams/gbrain-request-flow.mmd) — when
+either changes, update both and regenerate the SVG, PNG, and Excalidraw
+renders from the Mermaid source.
 
 **Two engines, one contract.** PGLite (Postgres 17 via WASM, zero-config, default) for personal brains up to ~50K pages. Postgres + pgvector (Supabase or self-hosted) for shared / large / multi-machine deployments. The contract-first `BrainEngine` interface in [`src/core/engine.ts`](src/core/engine.ts) defines the 140+ methods both engines implement; CLI and MCP server are generated from one source.
 
