@@ -29,8 +29,8 @@ beforeAll(async () => {
 
   // Seed test pages. Naming pattern:
   //   - alice-example: single-match case (only people/alice-*)
-  //   - bob-example vs bob-rosenstein: multi-match tiebreaker (bob-example wins on connections)
-  //   - charlie-example vs charlie-bankcroft: multi-match tiebreaker (charlie-example wins on connections)
+  //   - bob-example vs bob-rosenstein: ambiguous bare-name collision
+  //   - charlie-example vs charlie-bankcroft: ambiguous bare-name collision
   //   - dave-example: single-match case
   const pages = [
     { slug: 'people/alice-example', title: 'Alice Example', type: 'person' },
@@ -41,6 +41,7 @@ beforeAll(async () => {
     { slug: 'people/dave-example', title: 'Dave Example', type: 'person' },
     { slug: 'companies/stripe', title: 'Stripe', type: 'company' },
     { slug: 'companies/stripe-atlas', title: 'Stripe Atlas', type: 'company' },
+    { slug: 'companies/benton-capital', title: 'Benton Capital', type: 'company' },
   ];
 
   for (const p of pages) {
@@ -113,14 +114,14 @@ describe('resolveEntitySlug — prefix expansion', () => {
     expect(result).toBe('people/alice-example');
   });
 
-  it('resolves "Bob" to people/bob-example (more connections)', async () => {
+  it('refuses to choose between people sharing the same bare first name', async () => {
     const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'Bob');
-    expect(result).toBe('people/bob-example');
+    expect(result).toBe('bob');
   });
 
-  it('resolves "Charlie" to people/charlie-example (more connections)', async () => {
+  it('does not use connection count to turn bare-name ambiguity into confidence', async () => {
     const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'Charlie');
-    expect(result).toBe('people/charlie-example');
+    expect(result).toBe('charlie');
   });
 
   it('resolves "Dave" to people/dave-example (single match)', async () => {
@@ -145,9 +146,24 @@ describe('resolveEntitySlug — prefix expansion', () => {
     expect(result).toContain('alice-example');
   });
 
+  it('preserves a high-specificity multi-token typo match', async () => {
+    const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'Alice Exampl');
+    expect(result).toBe('people/alice-example');
+  });
+
   it('hyphenated input does NOT trigger prefix expansion', async () => {
     const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'alice-example');
     expect(result).toBe('people/alice-example');
+  });
+
+  it('preserves an explicit full company-name match', async () => {
+    const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'Benton Capital');
+    expect(result).toBe('companies/benton-capital');
+  });
+
+  it('refuses a company match supported mainly by a shared generic token', async () => {
+    const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'Beacon Capital');
+    expect(result).toBe('beacon-capital');
   });
 
   it('returns null for empty input', async () => {
@@ -306,5 +322,68 @@ describe('resolveEntitySlugWithSource — back-compat with resolveEntitySlug', (
     const b = await resolveEntitySlugWithSource(engine as unknown as BrainEngine, 'default', 'Zelda');
     expect(b!.slug).toBe(a!);
     expect(b!.source).toBe<ResolutionSource>('fallback_slugify');
+  });
+});
+
+describe('alias_exact branch (v0.46.15 identity wave, #3730)', () => {
+  it('an unambiguous registered alias resolves before prefix expansion / fuzzy', async () => {
+    await engine.setPageAliases('people/bob-rosenstein', 'default', ['rosey']);
+    const a = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'rosey');
+    expect(a).toBe('people/bob-rosenstein');
+    const b = await resolveEntitySlugWithSource(engine as unknown as BrainEngine, 'default', 'rosey');
+    expect(b!.slug).toBe('people/bob-rosenstein');
+    expect(b!.source).toBe<ResolutionSource>('alias_exact');
+  });
+
+  it('alias beats the ambiguous bare-name collision that prefix expansion refuses', async () => {
+    // "bob" prefix-expands ambiguously (bob-example vs bob-rosenstein) and
+    // previously fell to fallback_slugify('bob'). A registered alias resolves it.
+    await engine.setPageAliases('people/bob-example', 'default', ['bob']);
+    const r = await resolveEntitySlugWithSource(engine as unknown as BrainEngine, 'default', 'bob');
+    expect(r!.slug).toBe('people/bob-example');
+    expect(r!.source).toBe<ResolutionSource>('alias_exact');
+  });
+
+  it('a phantom alias (deleted page) is ignored — falls through to the old chain', async () => {
+    await engine.putPage('people/ghost-example', {
+      type: 'person', title: 'Ghost Example', compiled_truth: 'b', timeline: '', frontmatter: {},
+    } as never);
+    await engine.setPageAliases('people/ghost-example', 'default', ['spectre']);
+    await engine.softDeletePage('people/ghost-example');
+    const r = await resolveEntitySlugWithSource(engine as unknown as BrainEngine, 'default', 'spectre');
+    expect(r!.source).toBe<ResolutionSource>('fallback_slugify');
+    expect(r!.slug).toBe('spectre');
+  });
+});
+
+describe('alias_exact — liveness before uniqueness (v0.46.15 codex ship-review)', () => {
+  it('a stale sibling alias row (deleted page) cannot veto the sole live target', async () => {
+    await engine.putPage('people/nickname-live', {
+      type: 'person', title: 'Nickname Live', compiled_truth: 'b', timeline: '', frontmatter: {},
+    } as never);
+    await engine.putPage('people/nickname-old', {
+      type: 'person', title: 'Nickname Old', compiled_truth: 'b', timeline: '', frontmatter: {},
+    } as never);
+    await engine.setPageAliases('people/nickname-live', 'default', ['nicky']);
+    await engine.setPageAliases('people/nickname-old', 'default', ['nicky']);
+    await engine.softDeletePage('people/nickname-old');
+    // Raw-hit uniqueness would see 2 rows, reject, and fall through to
+    // fallback_slugify('nicky') — recreating a phantom slug on a WRITE path.
+    const r = await resolveEntitySlugWithSource(engine as unknown as BrainEngine, 'default', 'nicky');
+    expect(r!.slug).toBe('people/nickname-live');
+    expect(r!.source).toBe<ResolutionSource>('alias_exact');
+  });
+
+  it('two LIVE holders of the same alias stay ambiguous (no pointer)', async () => {
+    await engine.putPage('people/twin-a', {
+      type: 'person', title: 'Twin A', compiled_truth: 'b', timeline: '', frontmatter: {},
+    } as never);
+    await engine.putPage('people/twin-b', {
+      type: 'person', title: 'Twin B', compiled_truth: 'b', timeline: '', frontmatter: {},
+    } as never);
+    await engine.setPageAliases('people/twin-a', 'default', ['twinsy']);
+    await engine.setPageAliases('people/twin-b', 'default', ['twinsy']);
+    const r = await resolveEntitySlugWithSource(engine as unknown as BrainEngine, 'default', 'twinsy');
+    expect(r!.source).not.toBe<ResolutionSource>('alias_exact');
   });
 });

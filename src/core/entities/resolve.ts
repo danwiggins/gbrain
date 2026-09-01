@@ -10,18 +10,20 @@
  * Lives under `src/core/entities/` so signal-detector can reuse it for the
  * Sonnet pass too without circular import through facts/.
  *
- * Prefix-expansion step lives between fuzzy match and slugify fallback.
+ * Bare-name prefix expansion lives before fuzzy match and slugify fallback.
  * Bare first names like "Alice" score too low on pg_trgm (short strings
  * have terrible trigram overlap), so without this step they fall through
  * to slugify("Alice") → "alice", which spawns a phantom `people/alice.md`
  * stub at brain root instead of resolving to the existing
  * `people/alice-example` page. The fix queries `slug LIKE 'people/X-%'`
  * (then `companies/X-%`) when fuzzy fails on a single-word bare name, and
- * uses connection count (links + chunks) as the tiebreaker when multiple
- * candidates match.
+ * resolves only a single candidate; collisions fall through to the guarded
+ * unprefixed holding path rather than guessing from connection count.
  */
 
 import type { BrainEngine } from '../engine.ts';
+import { normalizeAlias } from '../search/alias-normalize.ts';
+import { isUndefinedTableError } from '../utils.ts';
 
 /**
  * Canonicalize a free-form entity reference to a page slug.
@@ -29,9 +31,10 @@ import type { BrainEngine } from '../engine.ts';
  * Resolution order:
  *   1. If `raw` is already a page slug shape (contains a "/" or matches an
  *      exact pages.slug row in this source), return it untouched.
- *   2. Try fuzzy match against pages.slug + pages.title within the source
- *      (case-insensitive). Pick the highest-trgm-score match if any.
- *   3. Fall back to a deterministic slugify: lowercase-no-spaces with
+ *   2. Resolve a bare name only when prefix expansion finds one candidate.
+ *   3. For multi-token input, require a high-specificity fuzzy match against
+ *      pages.slug + pages.title within the source (case-insensitive).
+ *   4. Fall back to a deterministic slugify: lowercase-no-spaces with
  *      hyphen-collapse. NOT prefixed with a directory — caller decides
  *      whether to prefix `people/`, `companies/`, etc.
  *
@@ -54,25 +57,80 @@ export async function resolveEntitySlug(
     if (exact) return exact;
   }
 
-  // 2. Fuzzy match against existing pages within the source. Match either
-  //    on slug fragment or on title.
-  const fuzzy = await tryFuzzyMatch(engine, source_id, trimmed);
-  if (fuzzy) return fuzzy;
+  // 1.5. Alias-exact (v0.46.15 identity wave, #3730): an unambiguous
+  //      page_aliases hit resolves BEFORE prefix expansion / fuzzy — the
+  //      alias table is curated ground truth ("saoirse" → people/saoirse-x)
+  //      while fuzzy is a guess. Live-page verified (page_aliases has no FK).
+  const aliased = await tryAliasExact(engine, source_id, trimmed);
+  if (aliased) return aliased;
 
-  // 3. Prefix-expansion match: when the input looks like a bare first name
+  // 2. Prefix-expansion match: when the input looks like a bare first name
   //    (no slash, no prefix, slugifies to a single short token), try
   //    `people/<token>-%` then `companies/<token>-%`. Short bare names
   //    score terribly on pg_trgm — similarity('alice', 'alice-example')
-  //    is below the 0.4 threshold — so this is the layer that catches
+  //    is below the fuzzy threshold — so this is the layer that catches
   //    `"Alice"` → `people/alice-example` before we phantom-stub a bare
   //    `people/alice.md`.
   if (isBareName(trimmed)) {
-    const expanded = await tryPrefixExpansion(engine, source_id, slugify(trimmed));
+    const expanded = await tryUnambiguousPrefixExpansion(engine, source_id, slugify(trimmed));
     if (expanded) return expanded;
+  } else {
+    // 3. Fuzzy match against existing pages within the source. Bare names
+    //    deliberately skip this arm: a shared first name is not specific
+    //    enough to choose one person by trigram score or popularity.
+    const fuzzy = await tryFuzzyMatch(engine, source_id, trimmed);
+    if (fuzzy) return fuzzy;
   }
 
   // 4. Fallback: deterministic slugify.
+  return fallbackSlugify(trimmed);
+}
+
+/**
+ * #3447 — shared fallback for both resolvers. slugify()'s `[^a-z0-9]+ → '-'`
+ * rule rewrites the path separator, so running slug-shaped input through it
+ * corrupts a well-formed slug (`people/alice-example` → `people-alice-example`)
+ * into one no page can ever have — and the flattened slug never resolves, so
+ * every re-extraction re-mints it. Path-shaped input is slugified PER SEGMENT
+ * (identity for already-well-formed slugs); display names keep plain slugify.
+ */
+function fallbackSlugify(trimmed: string): string {
+  if (trimmed.includes('/')) {
+    return trimmed.split('/').map(slugify).filter(Boolean).join('/');
+  }
   return slugify(trimmed);
+}
+
+/**
+ * Alias-exact arm (v0.46.15, #3730): unambiguous single-slug page_aliases hit,
+ * verified against LIVE pages — page_aliases has no FK to pages, so stale
+ * alias rows for deleted/renamed pages linger (outside-voice R2-8).
+ * Liveness is filtered BEFORE uniqueness (codex ship-review): a stale sibling
+ * row must not veto the sole live target — that fall-through would land on
+ * fuzzy/slugify and could recreate a phantom slug on a WRITE path.
+ * Fail-open on undefined-table (pre-v110 brains have no page_aliases table);
+ * other errors warn once per process so degradation isn't silent.
+ */
+let aliasExactWarned = false;
+async function tryAliasExact(engine: BrainEngine, source_id: string, raw: string): Promise<string | null> {
+  const norm = normalizeAlias(raw);
+  if (!norm) return null;
+  try {
+    const hits = (await engine.resolveAliases([norm], { sourceId: source_id })).get(norm) ?? [];
+    if (!hits.length) return null;
+    const rows = await engine.executeRaw<{ slug: string }>(
+      `SELECT slug FROM pages WHERE deleted_at IS NULL AND source_id = $1 AND slug = ANY($2::text[])`,
+      [source_id, [...new Set(hits.map((h) => h.slug))]],
+    );
+    const live = [...new Set(rows.map((r) => r.slug))];
+    return live.length === 1 ? live[0] : null;
+  } catch (err) {
+    if (!isUndefinedTableError(err) && !aliasExactWarned) {
+      aliasExactWarned = true;
+      console.error(`[gbrain] alias-exact resolution degraded (falling through to fuzzy): ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return null;
+  }
 }
 
 /**
@@ -94,7 +152,13 @@ function isBareName(raw: string): boolean {
   return true;
 }
 
-const PREFIX_EXPANSION_DIRS = ['people', 'companies'] as const;
+// hosts/projects joined people/companies after the 2026-08-06 memory eval: a
+// bare infra token ("hive") fell through to slugify and recall returned
+// nothing while the canonical hosts/<token> page + its facts sat one prefix
+// away. `infra/` is deliberately NOT here — it is a mixed namespace of
+// analysis/runbook documents (`infra/hive-dependency-audit-…`), and any such
+// doc would trip the ambiguity gate and re-break bare-token resolution.
+const PREFIX_EXPANSION_DIRS = ['people', 'companies', 'hosts', 'projects'] as const;
 
 /**
  * v0.40.2.0 — resolution-source-tagged variant for trajectory routing.
@@ -109,7 +173,7 @@ const PREFIX_EXPANSION_DIRS = ['people', 'companies'] as const;
  * The original `resolveEntitySlug` keeps its existing contract (returns
  * just the slug) for all pre-v0.40 call sites — no caller-side churn.
  */
-export type ResolutionSource = 'exact_page' | 'fuzzy_match' | 'fallback_slugify';
+export type ResolutionSource = 'exact_page' | 'alias_exact' | 'fuzzy_match' | 'fallback_slugify';
 
 export interface ResolveResult {
   slug: string;
@@ -131,15 +195,18 @@ export async function resolveEntitySlugWithSource(
     if (exact) return { slug: exact, source: 'exact_page' };
   }
 
-  const fuzzy = await tryFuzzyMatch(engine, source_id, trimmed);
-  if (fuzzy) return { slug: fuzzy, source: 'fuzzy_match' };
+  const aliased = await tryAliasExact(engine, source_id, trimmed);
+  if (aliased) return { slug: aliased, source: 'alias_exact' };
 
   if (isBareName(trimmed)) {
-    const expanded = await tryPrefixExpansion(engine, source_id, slugify(trimmed));
+    const expanded = await tryUnambiguousPrefixExpansion(engine, source_id, slugify(trimmed));
     if (expanded) return { slug: expanded, source: 'fuzzy_match' };
+  } else {
+    const fuzzy = await tryFuzzyMatch(engine, source_id, trimmed);
+    if (fuzzy) return { slug: fuzzy, source: 'fuzzy_match' };
   }
 
-  return { slug: slugify(trimmed), source: 'fallback_slugify' };
+  return { slug: fallbackSlugify(trimmed), source: 'fallback_slugify' };
 }
 
 /**
@@ -238,6 +305,15 @@ export async function findPrefixCandidates(
     // separately and will surface its own errors.
     return [];
   }
+}
+
+async function tryUnambiguousPrefixExpansion(
+  engine: BrainEngine,
+  source_id: string,
+  token: string,
+): Promise<string | null> {
+  const candidates = await findPrefixCandidates(engine, source_id, token);
+  return candidates.length === 1 ? candidates[0].slug : null;
 }
 
 /**
@@ -359,7 +435,11 @@ async function tryFuzzyMatch(
        LIMIT 3`,
       [source_id, lc, fragment],
     );
-    if (rows.length > 0 && rows[0].score >= 0.4) return rows[0].slug;
+    // 0.4 confidently misattributes names that share only a generic company
+    // token (for example "Beacon Capital" → "Benton Capital"). Keep fuzzy
+    // typo tolerance, but require high-specificity overlap before writing a
+    // fact to an existing entity.
+    if (rows.length > 0 && rows[0].score >= 0.7) return rows[0].slug;
   } catch {
     // pg_trgm functions might not be available on every engine config;
     // fall through to slugify.

@@ -12,20 +12,21 @@
  */
 
 import { describe, expect, test, beforeAll, afterAll, beforeEach } from 'bun:test';
-import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { withEnv } from './helpers/with-env.ts';
-import type { Page } from '../src/core/types.ts';
-import { recordCompleted } from '../src/core/op-checkpoint.ts';
+import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import {
   __setChatTransportForTests,
   __setEmbedTransportForTests,
+  configureGateway,
   resetGateway,
   type ChatResult,
 } from '../src/core/ai/gateway.ts';
 import {
   parseConversationMessages,
   splitIntoSegments,
-  splitLongFormMeeting,
   renderSegmentForExtraction,
   runExtractConversationFactsCore,
   extractConversationFactsFingerprint,
@@ -34,14 +35,57 @@ import {
   DEFAULT_SEGMENT_GAP_MINUTES,
   DEFAULT_SEGMENT_MAX_MESSAGES,
   SEGMENT_TEXT_CHAR_LIMIT,
-  LONG_FORM_MEETING_CHUNK_CHARS,
   MAX_PAGE_BODY_BYTES,
   TERMINAL_AUDIT_SOURCE,
-  CHECKPOINT_OP,
   NON_EXTRACTABLE_AUDIT_SOURCE,
-  DEFAULT_TYPES,
   PER_SEGMENT_SOURCE_PREFIX,
+  ALLOWED_TYPES,
+  pageTypesForAllowed,
+  ALLOWED_TYPE_ALIASES,
 } from '../src/commands/extract-conversation-facts.ts';
+import { _resetLlmCacheForTests } from '../src/core/conversation-parser/llm-base.ts';
+import { BudgetExhausted } from '../src/core/budget/budget-tracker.ts';
+
+// ---------------------------------------------------------------------------
+// pageTypesForAllowed — logical→concrete page-type expansion.
+// ---------------------------------------------------------------------------
+
+describe('pageTypesForAllowed', () => {
+  test('expands slack to canonical + granular collector types', () => {
+    expect(pageTypesForAllowed(['slack'])).toEqual(['slack', 'slack-dm-day', 'slack-thread']);
+  });
+
+  test('expands email to canonical + granular collector types', () => {
+    expect(pageTypesForAllowed(['email'])).toEqual(['email', 'email-digest']);
+  });
+
+  test('canonical-only types pass through unchanged', () => {
+    expect(pageTypesForAllowed(['meeting'])).toEqual(['meeting']);
+    expect(pageTypesForAllowed(['conversation'])).toEqual(['conversation']);
+  });
+
+  test('canonical name is always first so consolidated brains keep working', () => {
+    expect(pageTypesForAllowed(['slack'])[0]).toBe('slack');
+    expect(pageTypesForAllowed(['email'])[0]).toBe('email');
+  });
+
+  test('multiple logical types flatten and de-duplicate', () => {
+    const got = pageTypesForAllowed(['slack', 'email', 'meeting']);
+    expect(got).toEqual(['slack', 'slack-dm-day', 'slack-thread', 'email', 'email-digest', 'meeting']);
+    // no duplicates
+    expect(new Set(got).size).toBe(got.length);
+  });
+
+  test('every ALLOWED_TYPE_ALIASES entry lists its canonical name first', () => {
+    for (const [canonical, concretes] of Object.entries(ALLOWED_TYPE_ALIASES)) {
+      expect(concretes[0]).toBe(canonical);
+    }
+  });
+
+  test('empty input yields empty output', () => {
+    expect(pageTypesForAllowed([])).toEqual([]);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Fixture helpers.
@@ -96,6 +140,29 @@ describe('parseConversationMessages', () => {
   test('empty body returns empty array', () => {
     expect(parseConversationMessages('')).toEqual([]);
   });
+});
+
+test('conversation-facts allowlist includes native iMessage page types (#2756)', () => {
+  expect(ALLOWED_TYPES).toContain('imessage');
+  expect(ALLOWED_TYPES).toContain('imessage-daily');
+});
+
+test('parses a markdown-heading turn body (## User / ## Assistant)', () => {
+  const body = [
+    '## User',
+    'What is the capital of France?',
+    '## Assistant',
+    'The capital of France is Paris.',
+    'It is also its largest city.',
+  ].join('\n');
+  const msgs = parseConversationMessages(body, { fallbackDate: '2026-08-11' });
+  expect(msgs).toHaveLength(2);
+  expect(msgs[0].speaker).toBe('User');
+  expect(msgs[0].text).toBe('What is the capital of France?');
+  expect(msgs[1].speaker).toBe('Assistant');
+  expect(msgs[1].text).toBe(
+    'The capital of France is Paris.\nIt is also its largest city.',
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -166,40 +233,6 @@ describe('splitIntoSegments', () => {
   });
 });
 
-describe('splitLongFormMeeting', () => {
-  const page: Page = {
-    id: 1,
-    source_id: 'default',
-    slug: 'meetings/structured-summary',
-    type: 'meeting',
-    title: 'Structured meeting summary',
-    compiled_truth: '',
-    timeline: '',
-    frontmatter: {},
-    created_at: new Date('2026-07-20T10:00:00Z'),
-    updated_at: new Date('2026-07-20T12:00:00Z'),
-  };
-
-  test('chunks rich meeting notes without requiring chat-shaped messages', () => {
-    const body = `## Overview\n${'A grounded scientific update. '.repeat(220)}\n\n## Action items\nDan will review the assay.`;
-    const segments = splitLongFormMeeting(page, body);
-    expect(segments.length).toBeGreaterThan(1);
-    expect(segments.every((segment) => segment.format === 'long_form_meeting')).toBe(true);
-    expect(segments.every((segment) => segment.messages[0].text.length <= LONG_FORM_MEETING_CHUNK_CHARS)).toBe(true);
-  });
-
-  test('does not route Slack noise or short/unstructured meeting text', () => {
-    expect(splitLongFormMeeting({ ...page, type: 'slack' }, '## Overview\n' + 'x'.repeat(500))).toEqual([]);
-    expect(splitLongFormMeeting(page, 'Alice spoke first. Bob answered later.')).toEqual([]);
-  });
-
-  test('uses updated_at timestamps for freshness-aware resume', () => {
-    const body = `## Summary\n${'Decision and evidence. '.repeat(30)}`;
-    expect(splitLongFormMeeting(page, body, { sinceIso: '2026-07-20T11:59:59Z' })).toHaveLength(1);
-    expect(splitLongFormMeeting(page, body, { sinceIso: '2026-07-20T12:00:00Z' })).toHaveLength(0);
-  });
-});
-
 // ---------------------------------------------------------------------------
 // renderSegmentForExtraction.
 // ---------------------------------------------------------------------------
@@ -230,28 +263,6 @@ describe('renderSegmentForExtraction', () => {
     expect(text.length).toBeLessThanOrEqual(SEGMENT_TEXT_CHAR_LIMIT + 32);
     expect(text.startsWith('Page: big-page')).toBe(true);
     expect(text).toContain('Conversation between');
-  });
-
-  test('labels long-form meeting notes without pretending they are a conversation', () => {
-    const page: Page = {
-      id: 1,
-      source_id: 'default',
-      slug: 'meetings/structured-summary',
-      type: 'meeting',
-      title: 'Structured meeting summary',
-      compiled_truth: '',
-      timeline: '',
-      frontmatter: {},
-      created_at: new Date('2026-07-20T10:00:00Z'),
-      updated_at: new Date('2026-07-20T12:00:00Z'),
-    };
-    const segment = splitLongFormMeeting(
-      page,
-      `## Overview\n${'Grounded update. '.repeat(30)}`,
-    )[0];
-    const text = renderSegmentForExtraction(page.title, segment);
-    expect(text).toContain('Long-form meeting notes updated');
-    expect(text).not.toContain('Conversation between');
   });
 });
 
@@ -292,23 +303,6 @@ describe('checkpoint entry encoding', () => {
     const decoded = decodeCheckpointEntry(entry);
     expect(decoded?.slug).toBe('conversations/group/2024/march/team-x');
   });
-
-  test('intra-page rowNum watermark round-trips; new entries always carry it (incl 0)', () => {
-    // New entries encode the rowNum (even 0) → always 4-field.
-    const e0 = encodeCheckpointEntry('default', 'conversations/x', '2024-03-16T08:05:00Z', 0);
-    expect(e0).toBe('default|conversations/x|2024-03-16T08:05:00Z|0');
-    expect(decodeCheckpointEntry(e0)?.rowNum).toBe(0);
-
-    const e5 = encodeCheckpointEntry('default', 'conversations/x', '2024-03-16T08:05:00Z', 5);
-    expect(decodeCheckpointEntry(e5)?.rowNum).toBe(5);
-
-    // Legacy 3-field entry (no rowNum) decodes with rowNum undefined — the
-    // signal cpEntriesToMap uses to force a safe full re-extract (no
-    // tail-only resume that would wipe an unaccounted committed prefix).
-    const legacy = encodeCheckpointEntry('default', 'conversations/x', '2024-03-16T08:05:00Z');
-    expect(legacy).toBe('default|conversations/x|2024-03-16T08:05:00Z');
-    expect(decodeCheckpointEntry(legacy)?.rowNum).toBeUndefined();
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -327,19 +321,74 @@ const SAMPLE_BODY = [
 
 describe('runExtractConversationFactsCore', () => {
   let engine: PGLiteEngine;
+  let repoDir: string;
+  let chatFailure: Error | null = null;
+  let chatHook: (() => Promise<void>) | null = null;
+  let mainChatCalls = 0;
+  let chatStopReason: ChatResult['stopReason'] = 'end';
+  let chatTextOverride: string | null = null;
+  let embeddedTexts: string[] = [];
+  let fallbackCalls = 0;
+  let fallbackContents: string[] = [];
+  let fallbackControlError: Error | null = null;
+  let fallbackOnCall: (() => void) | null = null;
+  let fallbackSingleMessage = false;
+  let fallbackUsage = { input_tokens: 100, output_tokens: 50 };
 
   beforeAll(async () => {
     engine = new PGLiteEngine();
     await engine.connect({});
     await engine.initSchema();
+    repoDir = mkdtempSync(join(tmpdir(), 'gbrain-convo-facts-'));
 
     // Deterministic chat-transport stub. Records calls + returns one
     // fact per turn. Real-LLM extraction quality is the eval suite's job.
     let callIndex = 0;
-    __setChatTransportForTests(async (): Promise<ChatResult> => {
+    __setChatTransportForTests(async (opts): Promise<ChatResult> => {
+      if (String(opts.system).includes('You parse messages out of a chat-log body')) {
+        fallbackCalls++;
+        const content = String(opts.messages[0]?.content ?? '');
+        fallbackContents.push(content);
+        fallbackOnCall?.();
+        if (fallbackControlError) throw fallbackControlError;
+        const messages = content.includes('chunk-line-200')
+          ? [
+              { speaker: 'Tail Alpha', timestamp: '2026-06-02T10:00:00Z', text: 'tail first' },
+              { speaker: 'Tail Beta', timestamp: '2026-06-02T10:05:00Z', text: 'tail second' },
+            ]
+          : content.includes('chunk-line-000')
+            ? [
+                { speaker: 'Head Alpha', timestamp: '2026-06-02T09:00:00Z', text: 'head first' },
+                { speaker: 'Head Beta', timestamp: '2026-06-02T09:05:00Z', text: 'head second' },
+              ]
+            : content.includes('chunk-line-080')
+              ? []
+              : [
+                { speaker: 'Alpha Example', timestamp: '2026-06-02T09:00:00Z', text: 'first' },
+                { speaker: 'Beta Example', timestamp: '2026-06-02T09:05:00Z', text: 'second' },
+              ];
+        return {
+          text: JSON.stringify(fallbackSingleMessage ? messages.slice(0, 1) : messages),
+          blocks: [],
+          stopReason: 'end',
+          usage: {
+            input_tokens: fallbackUsage.input_tokens,
+            output_tokens: fallbackUsage.output_tokens,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+          },
+          model: opts.model!,
+          providerId: 'stub',
+        };
+      }
+      mainChatCalls++;
+      if (chatFailure) throw chatFailure;
+      const hook = chatHook;
+      chatHook = null;
+      if (hook) await hook();
       callIndex++;
       return {
-        text: JSON.stringify({
+        text: chatTextOverride ?? JSON.stringify({
           facts: [{
             fact: `synthetic fact #${callIndex}`,
             kind: 'event',
@@ -349,7 +398,7 @@ describe('runExtractConversationFactsCore', () => {
           }],
         }),
         blocks: [],
-        stopReason: 'end',
+        stopReason: chatStopReason,
         usage: {
           input_tokens: 100,
           output_tokens: 50,
@@ -363,9 +412,10 @@ describe('runExtractConversationFactsCore', () => {
 
     // Deterministic embedding stub.
     __setEmbedTransportForTests(
-      (async () => ({
-        embeddings: [Array.from({ length: 1536 }, () => 0.1)],
-      })) as never,
+      (async ({ values }: { values: string[] }) => {
+        embeddedTexts.push(...values);
+        return { embeddings: values.map(() => Array.from({ length: 1536 }, () => 0.1)) };
+      }) as never,
     );
   });
 
@@ -374,17 +424,34 @@ describe('runExtractConversationFactsCore', () => {
     __setEmbedTransportForTests(null);
     resetGateway();
     await engine.disconnect();
+    rmSync(repoDir, { recursive: true, force: true });
   });
 
   beforeEach(async () => {
+    chatFailure = null;
+    chatHook = null;
+    mainChatCalls = 0;
+    chatStopReason = 'end';
+    chatTextOverride = null;
+    embeddedTexts = [];
+    fallbackCalls = 0;
+    fallbackContents = [];
+    fallbackControlError = null;
+    fallbackOnCall = null;
+    fallbackSingleMessage = false;
+    fallbackUsage = { input_tokens: 100, output_tokens: 50 };
+    _resetLlmCacheForTests();
     // Clean state per test. Use executeRaw because PGLite uses different
     // truncation semantics than the canonical reset helper.
     await engine.executeRaw(`DELETE FROM facts WHERE source LIKE 'cli:extract-conversation-facts%'`);
     await engine.executeRaw(`DELETE FROM op_checkpoints WHERE op = 'extract-conversation-facts'`);
+    await engine.executeRaw(`DELETE FROM extract_rollup_7d`);
+    await engine.executeRaw(`DELETE FROM conversation_parser_llm_cache`);
     await engine.executeRaw(`DELETE FROM pages WHERE slug LIKE 'conversations/%' OR slug LIKE 'people/alice%'`);
     // Set facts.extraction_enabled=true so kill-switch doesn't refuse.
     await engine.setConfig('facts.extraction_enabled', 'true');
-    await engine.executeRaw(`DELETE FROM config WHERE key = 'conversation_parser.llm_fallback_enabled'`);
+    await engine.setConfig('conversation_parser.llm_fallback_enabled', 'false');
+    await engine.setConfig('sync.repo_path', repoDir);
     // Seed test pages.
     await engine.putPage('conversations/imessage/alice-example', {
       type: 'conversation',
@@ -393,12 +460,64 @@ describe('runExtractConversationFactsCore', () => {
       timeline: '',
       frontmatter: {},
     });
+    await engine.putPage('conversations/imessage/native-example', {
+      type: 'imessage',
+      title: 'Native iMessage export',
+      compiled_truth: SAMPLE_BODY,
+      timeline: '',
+      frontmatter: {},
+    });
+    await engine.putPage('conversations/novel-format-example', {
+      type: 'conversation',
+      title: 'Novel chat export',
+      compiled_truth: [
+        'Alpha Example ~~ 09:00 ~~ first',
+        'Beta Example ~~ 09:05 ~~ second',
+      ].join('\n'),
+      timeline: '',
+      frontmatter: { date: '2026-06-02' },
+    });
+    await engine.putPage('conversations/long-novel-format-example', {
+      type: 'conversation',
+      title: 'Long novel chat export',
+      compiled_truth: Array.from(
+        { length: 205 },
+        (_, i) => `opaque chunk-line-${String(i).padStart(3, '0')}`,
+      ).join('\n'),
+      timeline: '',
+      frontmatter: { date: '2026-06-02' },
+    });
     await engine.putPage('people/alice-example', {
       type: 'person',
       title: 'Alice Example',
       compiled_truth: 'Profile content for Alice Example.',
       timeline: '',
       frontmatter: {},
+    });
+    const rawDir = join(repoDir, 'meetings/raw-speaker-example.raw');
+    mkdirSync(rawDir, { recursive: true });
+    writeFileSync(
+      join(rawDir, 'transcript.txt'),
+      [
+        'Speaker A: We finally shipped the parser fix.',
+        'Speaker B: Good. Now rerun extraction.',
+        'Speaker A: I also turned the fallback flag on.',
+        'Speaker B: Perfect.',
+      ].join('\n'),
+      'utf8',
+    );
+    await engine.putPage('meetings/raw-speaker-example', {
+      type: 'meeting',
+      title: 'Raw speaker transcript example',
+      compiled_truth: [
+        '## Executive Summary',
+        '- This is a polished meeting note, not the transcript.',
+      ].join('\n'),
+      timeline: '',
+      frontmatter: {
+        date: '2026-06-01',
+        raw_transcript: 'meetings/raw-speaker-example.raw/transcript.txt',
+      },
     });
   });
 
@@ -415,6 +534,75 @@ describe('runExtractConversationFactsCore', () => {
     expect(result.segments_processed).toBeGreaterThanOrEqual(1);
   });
 
+  test('historical backfill embeds and retains high, medium, low, and absent-tier facts', async () => {
+    // Regression target: passing high-only admission into the historical
+    // extractor call would suppress low (and absent-tier) facts before embed.
+    chatTextOverride = JSON.stringify({
+      facts: [
+        { fact: 'historical-high', kind: 'event', notability: 'high' },
+        { fact: 'historical-medium', kind: 'fact', notability: 'medium' },
+        { fact: 'historical-low', kind: 'fact', notability: 'low' },
+        { fact: 'historical-absent', kind: 'fact' },
+      ],
+    });
+    configureGateway({
+      embedding_model: 'openai:text-embedding-3-small',
+      embedding_dimensions: 1536,
+      env: { OPENAI_API_KEY: 'test' },
+    });
+    await engine.putPage('conversations/historical-tier-coverage', {
+      type: 'conversation',
+      title: 'Historical tier coverage',
+      compiled_truth: [
+        fmt('Alice Example', '2024-03-15', '9:00 AM', 'first message'),
+        fmt('Bob Demo', '2024-03-15', '9:05 AM', 'second message'),
+      ].join('\n'),
+      timeline: '',
+      frontmatter: {},
+    });
+
+    const result = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/historical-tier-coverage',
+      sleepMs: 0,
+    });
+    const rows = await engine.executeRaw<{ fact: string; notability: string; has_embedding: boolean }>(
+      `SELECT fact, notability, embedding IS NOT NULL AS has_embedding
+       FROM facts WHERE source = $1 ORDER BY row_num`,
+      [PER_SEGMENT_SOURCE_PREFIX],
+    );
+
+    expect(result.facts_extracted).toBe(4);
+    expect(result.facts_inserted).toBe(4);
+    expect(embeddedTexts).toEqual([
+      'historical-high',
+      'historical-medium',
+      'historical-low',
+      'historical-absent',
+    ]);
+    expect(rows).toEqual([
+      { fact: 'historical-high', notability: 'high', has_embedding: true },
+      { fact: 'historical-medium', notability: 'medium', has_embedding: true },
+      { fact: 'historical-low', notability: 'low', has_embedding: true },
+      { fact: 'historical-absent', notability: 'medium', has_embedding: true },
+    ]);
+  });
+
+  test('dry-run does not write the extract_rollup_7d cache row', async () => {
+    // Regression: --dry-run promises "no DB writes" but writeRunReceiptAndRollup
+    // upsert-ed extract_rollup_7d unconditionally. A preview must not mutate the DB.
+    await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/imessage/alice-example',
+      dryRun: true,
+      sleepMs: 0,
+    });
+    const rows = await engine.executeRaw<{ count: string | number }>(
+      `SELECT COUNT(*) AS count FROM extract_rollup_7d WHERE kind = 'facts.conversation' AND source_id = 'default'`,
+    );
+    expect(Number(rows[0]?.count ?? 0)).toBe(0);
+  });
+
   test('non-conversation pages are skipped', async () => {
     const result = await runExtractConversationFactsCore(engine, {
       sourceId: 'default',
@@ -424,6 +612,225 @@ describe('runExtractConversationFactsCore', () => {
     });
     // pages_considered counts only pages whose type matches the allowlist.
     expect(result.pages_considered).toBe(0);
+  });
+
+  test('native imessage page types are eligible by default', async () => {
+    const result = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/imessage/native-example',
+      dryRun: true,
+      sleepMs: 0,
+    });
+    expect(result.pages_considered).toBe(1);
+    expect(result.pages_processed).toBe(1);
+  });
+
+  test('LLM fallback is privacy-gated off by default', async () => {
+    const result = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/novel-format-example',
+      sleepMs: 0,
+    });
+    expect(result.pages_llm_fallback).toBe(0);
+    expect(result.pages_skipped).toBe(1);
+    expect(fallbackCalls).toBe(0);
+  });
+
+  test('dry-run never calls the provider even when fallback is enabled', async () => {
+    await engine.setConfig('conversation_parser.llm_fallback_enabled', 'true');
+    const result = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/novel-format-example',
+      dryRun: true,
+      sleepMs: 0,
+    });
+    expect(result.pages_llm_fallback).toBe(0);
+    expect(result.pages_skipped).toBe(1);
+    expect(fallbackCalls).toBe(0);
+  });
+
+  test('opt-in fallback receives page date and advances the page checkpoint', async () => {
+    await engine.setConfig('conversation_parser.llm_fallback_enabled', 'true');
+    await withEnv({ ANTHROPIC_API_KEY: 'sk-test' }, async () => {
+      const first = await runExtractConversationFactsCore(engine, {
+        sourceId: 'default',
+        slug: 'conversations/novel-format-example',
+        sleepMs: 0,
+      });
+      expect(first.pages_llm_fallback).toBe(1);
+      expect(first.pages_processed).toBe(1);
+      expect(first.segments_processed).toBe(1);
+      expect(fallbackCalls).toBe(1);
+      expect(fallbackContents[0]).toContain(
+        '<conversation-date>2026-06-02</conversation-date>',
+      );
+
+      const second = await runExtractConversationFactsCore(engine, {
+        sourceId: 'default',
+        slug: 'conversations/novel-format-example',
+        sleepMs: 0,
+      });
+      expect(second.pages_processed).toBe(0);
+      // The durable completion outcome skips the replay before any parse.
+      expect(second.pages_skipped_completed).toBe(1);
+      expect(fallbackCalls).toBe(1);
+    });
+  });
+
+  test('opt-in fallback processes and checkpoints transcript lines after 200', async () => {
+    await engine.setConfig('conversation_parser.llm_fallback_enabled', 'true');
+    await withEnv({ ANTHROPIC_API_KEY: 'sk-test' }, async () => {
+      const first = await runExtractConversationFactsCore(engine, {
+        sourceId: 'default',
+        slug: 'conversations/long-novel-format-example',
+        sleepMs: 0,
+      });
+      expect(first.pages_llm_fallback).toBe(1);
+      expect(first.pages_processed).toBe(1);
+      expect(first.segments_processed).toBe(2);
+      expect(fallbackCalls).toBe(3);
+      expect(fallbackContents[2]).toContain('chunk-line-200');
+
+      const second = await runExtractConversationFactsCore(engine, {
+        sourceId: 'default',
+        slug: 'conversations/long-novel-format-example',
+        sleepMs: 0,
+      });
+      expect(second.pages_processed).toBe(0);
+      // The durable completion outcome skips the replay before any parse.
+      expect(second.pages_skipped_completed).toBe(1);
+      expect(fallbackCalls).toBe(3);
+    });
+  });
+
+  test('opt-in fallback preserves the extraction budget-stop outcome', async () => {
+    await engine.setConfig('conversation_parser.llm_fallback_enabled', 'true');
+    fallbackControlError = new BudgetExhausted('test budget stop', {
+      reason: 'cost',
+      spent: 1,
+      cap: 1,
+    });
+    await withEnv({ ANTHROPIC_API_KEY: 'sk-test' }, async () => {
+      const result = await runExtractConversationFactsCore(engine, {
+        sourceId: 'default',
+        slug: 'conversations/novel-format-example',
+        sleepMs: 0,
+      });
+      expect(result.budget_exhausted).toBe(true);
+      expect(result.pages_processed).toBe(0);
+      expect(result.pages_llm_fallback).toBe(0);
+      expect(fallbackCalls).toBe(1);
+    });
+  });
+
+  test('final fallback call reports a post-record budget overage', async () => {
+    await engine.setConfig('conversation_parser.llm_fallback_enabled', 'true');
+    fallbackSingleMessage = true;
+    fallbackUsage = { input_tokens: 10_000_000, output_tokens: 1_000_000 };
+    await withEnv({ ANTHROPIC_API_KEY: 'sk-test' }, async () => {
+      const result = await runExtractConversationFactsCore(engine, {
+        sourceId: 'default',
+        slug: 'conversations/novel-format-example',
+        sleepMs: 0,
+        maxCostUsd: 1,
+      });
+      expect(result.budget_exhausted).toBe(true);
+      expect(result.pages_processed).toBe(0);
+      expect(result.pages_skipped).toBe(1);
+      expect(result.spent_usd).toBeGreaterThan(1);
+      expect(fallbackCalls).toBe(1);
+    });
+  });
+
+  test('extraction BudgetExhausted halts the run after one attempt (#3669)', async () => {
+    // Regression: extractFactsFromTurnWithOutcome folds a BudgetExhausted
+    // thrown by the provider into `{ ok: false, error }`; the per-segment
+    // failure branch used to wrap it in a plain Error, stripping the
+    // BUDGET_EXHAUSTED tag. The worker pool's D13 must-abort check never
+    // fired, so every remaining page burned a doomed reserve-denied attempt
+    // instead of the run halting with budget_exhausted = true.
+    chatFailure = new BudgetExhausted('reserve denied', {
+      reason: 'cost',
+      spent: 5,
+      cap: 5,
+    });
+    await withEnv({ ANTHROPIC_API_KEY: 'sk-test' }, async () => {
+      const result = await runExtractConversationFactsCore(engine, {
+        sourceId: 'default',
+        sleepMs: 0,
+      });
+      // Halted-with-receipt, not a per-page failure loop: exactly ONE
+      // extraction attempt (not one per eligible page), and the partial
+      // result reports the budget stop.
+      expect(result.budget_exhausted).toBe(true);
+      expect(mainChatCalls).toBe(1);
+      expect(result.pages_failed).toBe(0);
+    });
+  });
+
+  test('provider AbortError fails open while the caller signal is live', async () => {
+    await engine.setConfig('conversation_parser.llm_fallback_enabled', 'true');
+    fallbackControlError = Object.assign(new Error('provider timeout'), { name: 'AbortError' });
+    const controller = new AbortController();
+    await withEnv({ ANTHROPIC_API_KEY: 'sk-test' }, async () => {
+      const result = await runExtractConversationFactsCore(
+        engine,
+        {
+          sourceId: 'default',
+          slug: 'conversations/novel-format-example',
+          sleepMs: 0,
+        },
+        controller.signal,
+      );
+      expect(result.pages_skipped).toBe(1);
+      expect(result.pages_llm_fallback).toBe(0);
+      expect(fallbackCalls).toBe(1);
+    });
+  });
+
+  test('caller cancellation propagates through the fallback promptly', async () => {
+    await engine.setConfig('conversation_parser.llm_fallback_enabled', 'true');
+    fallbackControlError = Object.assign(new Error('caller cancelled'), { name: 'AbortError' });
+    const controller = new AbortController();
+    controller.abort();
+    await withEnv({ ANTHROPIC_API_KEY: 'sk-test' }, async () => {
+      await expect(
+        runExtractConversationFactsCore(
+          engine,
+          {
+            sourceId: 'default',
+            slug: 'conversations/novel-format-example',
+            sleepMs: 0,
+          },
+          controller.signal,
+        ),
+      ).rejects.toMatchObject({ name: 'AbortError' });
+    });
+  });
+
+  test('caller cancellation propagates from a final pooled batch', async () => {
+    await engine.setConfig('conversation_parser.llm_fallback_enabled', 'true');
+    const cancellation = Object.assign(new Error('caller cancelled in pool'), {
+      name: 'AbortError',
+    });
+    const controller = new AbortController();
+    fallbackOnCall = () => controller.abort(cancellation);
+    fallbackControlError = cancellation;
+    await withEnv({ ANTHROPIC_API_KEY: 'sk-test' }, async () => {
+      await expect(
+        runExtractConversationFactsCore(
+          engine,
+          {
+            sourceId: 'default',
+            types: ['conversation'],
+            workers: 1,
+            sleepMs: 0,
+          },
+          controller.signal,
+        ),
+      ).rejects.toBe(cancellation);
+      expect(fallbackCalls).toBe(1);
+    });
   });
 
   test('sinceIso filters already-processed history', async () => {
@@ -436,6 +843,18 @@ describe('runExtractConversationFactsCore', () => {
     });
     expect(result.pages_processed).toBe(0);
     expect(result.pages_skipped).toBe(1);
+  });
+
+  test('meeting page reads raw_transcript sidecar instead of polished summary body', async () => {
+    const result = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'meetings/raw-speaker-example',
+      dryRun: true,
+      sleepMs: 0,
+    });
+    expect(result.pages_processed).toBe(1);
+    expect(result.segments_processed).toBeGreaterThanOrEqual(1);
+    expect(result.pages_skipped).toBe(0);
   });
 
   test('writes facts with per-segment source_session AND terminal audit row (E16)', async () => {
@@ -454,19 +873,82 @@ describe('runExtractConversationFactsCore', () => {
     );
     expect(Number(perSegFacts[0]?.count ?? 0)).toBeGreaterThan(0);
 
+    const validTimes = await engine.executeRaw<{ valid_from: Date }>(
+      `SELECT valid_from FROM facts
+       WHERE source = $1 AND source_session = $2
+       ORDER BY valid_from ASC`,
+      [PER_SEGMENT_SOURCE_PREFIX, `${PER_SEGMENT_SOURCE_PREFIX}:conversations/imessage/alice-example`],
+    );
+    expect(validTimes.map((row) => new Date(row.valid_from).toISOString())).toEqual([
+      '2024-03-15T09:00:00.000Z',
+      '2024-03-16T08:00:00.000Z',
+    ]);
+
     // Terminal audit row present.
     const terminalRows = await engine.executeRaw<{ count: string | number }>(
-      `SELECT COUNT(*) AS count FROM facts WHERE source = $1 AND source_session = $2`,
-      [TERMINAL_AUDIT_SOURCE, `${TERMINAL_AUDIT_SOURCE}:conversations/imessage/alice-example`],
+      `SELECT COUNT(*) AS count FROM facts
+        WHERE source = $1 AND source_session LIKE $2`,
+      [TERMINAL_AUDIT_SOURCE, `${TERMINAL_AUDIT_SOURCE}:conversations/imessage/alice-example:page-%`],
     );
     expect(Number(terminalRows[0]?.count ?? 0)).toBe(1);
   });
 
-  test('durable terminal outcome skips completed pages after checkpoint GC', async () => {
+  test('canonicalizes a raw LLM entity display name before writing facts.entity_slug', async () => {
+    chatTextOverride = JSON.stringify({
+      facts: [{
+        fact: 'Alice Example signed the offer letter.',
+        kind: 'event',
+        entity: 'Alice Example',
+        confidence: 1.0,
+        notability: 'high',
+      }],
+    });
+
     await runExtractConversationFactsCore(engine, {
       sourceId: 'default',
       slug: 'conversations/imessage/alice-example',
-      types: ['conversation'],
+      sleepMs: 0,
+    });
+
+    const rows = await engine.executeRaw<{ entity_slug: string | null }>(
+      `SELECT entity_slug FROM facts
+        WHERE source = $1 AND source_markdown_slug = $2`,
+      [PER_SEGMENT_SOURCE_PREFIX, 'conversations/imessage/alice-example'],
+    );
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every((row) => row.entity_slug === 'people/alice-example')).toBe(true);
+  });
+
+  test('preserves an already-canonical LLM entity slug', async () => {
+    chatTextOverride = JSON.stringify({
+      facts: [{
+        fact: 'Alice Example started the new role.',
+        kind: 'event',
+        entity: 'people/alice-example',
+        confidence: 1.0,
+        notability: 'high',
+      }],
+    });
+
+    await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/imessage/alice-example',
+      sleepMs: 0,
+    });
+
+    const rows = await engine.executeRaw<{ entity_slug: string | null }>(
+      `SELECT entity_slug FROM facts
+        WHERE source = $1 AND source_markdown_slug = $2`,
+      [PER_SEGMENT_SOURCE_PREFIX, 'conversations/imessage/alice-example'],
+    );
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every((row) => row.entity_slug === 'people/alice-example')).toBe(true);
+  });
+
+  test('terminal outcome skips a completed page after checkpoint GC', async () => {
+    await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/imessage/alice-example',
       sleepMs: 0,
     });
     await engine.executeRaw(
@@ -476,7 +958,6 @@ describe('runExtractConversationFactsCore', () => {
     const second = await runExtractConversationFactsCore(engine, {
       sourceId: 'default',
       slug: 'conversations/imessage/alice-example',
-      types: ['conversation'],
       sleepMs: 0,
     });
     expect(second.pages_skipped_completed).toBe(1);
@@ -484,11 +965,10 @@ describe('runExtractConversationFactsCore', () => {
     expect(second.segments_processed).toBe(0);
   });
 
-  test('page update makes an older terminal outcome stale and eligible again', async () => {
+  test('page edits make an older terminal outcome stale', async () => {
     await runExtractConversationFactsCore(engine, {
       sourceId: 'default',
       slug: 'conversations/imessage/alice-example',
-      types: ['conversation'],
       sleepMs: 0,
     });
     await engine.putPage('conversations/imessage/alice-example', {
@@ -505,15 +985,13 @@ describe('runExtractConversationFactsCore', () => {
     const second = await runExtractConversationFactsCore(engine, {
       sourceId: 'default',
       slug: 'conversations/imessage/alice-example',
-      types: ['conversation'],
       sleepMs: 0,
     });
     expect(second.pages_skipped_completed).toBe(0);
     expect(second.pages_processed).toBe(1);
-    expect(second.segments_processed).toBeGreaterThan(0);
   });
 
-  test('records and durably skips scanned pages with no extractable segment', async () => {
+  test('records and then skips a definitive scan with no eligible segment', async () => {
     await engine.putPage('conversations/single-message', {
       type: 'slack',
       title: 'Single message',
@@ -529,17 +1007,15 @@ describe('runExtractConversationFactsCore', () => {
     });
     expect(first.pages_marked_non_extractable).toBe(1);
     const markers = await engine.executeRaw<{ count: string | number }>(
-      `SELECT COUNT(*) AS count FROM facts WHERE source = $1 AND source_session = $2`,
+      `SELECT COUNT(*) AS count FROM facts
+        WHERE source = $1 AND source_session LIKE $2`,
       [
         NON_EXTRACTABLE_AUDIT_SOURCE,
-        `${NON_EXTRACTABLE_AUDIT_SOURCE}:conversations/single-message`,
+        `${NON_EXTRACTABLE_AUDIT_SOURCE}:conversations/single-message:page-%`,
       ],
     );
     expect(Number(markers[0]?.count ?? 0)).toBe(1);
 
-    await engine.executeRaw(
-      `DELETE FROM op_checkpoints WHERE op = 'extract-conversation-facts'`,
-    );
     const second = await runExtractConversationFactsCore(engine, {
       sourceId: 'default',
       slug: 'conversations/single-message',
@@ -550,123 +1026,7 @@ describe('runExtractConversationFactsCore', () => {
     expect(second.pages_marked_non_extractable).toBe(0);
   });
 
-  test('extracts facts from rich structured meeting notes instead of marking them non-extractable', async () => {
-    const slug = 'meetings/structured-summary';
-    await engine.putPage(slug, {
-      type: 'meeting',
-      title: 'Structured meeting summary',
-      compiled_truth: `## Overview\n${'CES2 assay evidence and interpretation. '.repeat(20)}\n\n## Action items\nDan will review the assay controls.`,
-      timeline: '',
-      frontmatter: { date: '2026-07-19' },
-    });
-    const result = await runExtractConversationFactsCore(engine, {
-      sourceId: 'default',
-      slug,
-      types: ['meeting'],
-      sleepMs: 0,
-    });
-    expect(result.pages_long_form_meeting).toBe(1);
-    expect(result.pages_processed).toBe(1);
-    expect(result.facts_inserted).toBeGreaterThan(0);
-    expect(result.pages_marked_non_extractable).toBe(0);
-  });
-
-  test('retries a rich meeting hidden by a fresh chat-only negative marker', async () => {
-    const slug = 'meetings/legacy-negative';
-    await engine.putPage(slug, {
-      type: 'meeting',
-      title: 'Legacy negative meeting',
-      compiled_truth: `## Overview\n${'Grounded CES2 evidence and interpretation. '.repeat(20)}\n\n## Action items\nReview the controls.`,
-      timeline: '',
-      frontmatter: { date: '2026-07-19' },
-    });
-    await engine.executeRaw(
-      `INSERT INTO facts (
-         source_id, fact, kind, source, source_session,
-         source_markdown_slug, row_num, valid_from
-       ) VALUES ($1, $2, 'fact', $3, $4, $5, 0, now())`,
-      [
-        'default',
-        'EXTRACTION_NOT_APPLICABLE: legacy chat-only classification',
-        NON_EXTRACTABLE_AUDIT_SOURCE,
-        `${NON_EXTRACTABLE_AUDIT_SOURCE}:${slug}`,
-        slug,
-      ],
-    );
-    const result = await runExtractConversationFactsCore(engine, {
-      sourceId: 'default',
-      slug,
-      types: ['meeting'],
-      sleepMs: 0,
-    });
-    expect(result.pages_skipped_non_extractable).toBe(0);
-    expect(result.pages_processed).toBe(1);
-    expect(result.facts_inserted).toBeGreaterThan(0);
-  });
-
-  test('retries a rich meeting with a fresh terminal marker but zero extracted facts', async () => {
-    const slug = 'meetings/zero-fact-terminal';
-    await engine.putPage(slug, {
-      type: 'meeting',
-      title: 'Zero fact terminal meeting',
-      compiled_truth: `## Overview\n${'Grounded study evidence and interpretation. '.repeat(20)}\n\n## Action items\nReview the controls.`,
-      timeline: '',
-      frontmatter: { date: '2026-07-19' },
-    });
-    await engine.executeRaw(
-      `INSERT INTO facts (
-         source_id, fact, kind, source, source_session,
-         source_markdown_slug, row_num, valid_from
-       ) VALUES ($1, $2, 'fact', $3, $4, $5, 0, now())`,
-      [
-        'default',
-        'EXTRACTION_COMPLETE',
-        TERMINAL_AUDIT_SOURCE,
-        `${TERMINAL_AUDIT_SOURCE}:${slug}`,
-        slug,
-      ],
-    );
-    await recordCompleted(
-      engine,
-      {
-        op: CHECKPOINT_OP,
-        fingerprint: extractConversationFactsFingerprint({ sourceId: 'default' }),
-      },
-      [encodeCheckpointEntry('default', slug, '2026-07-19T23:59:59.000Z', 1)],
-    );
-    const result = await runExtractConversationFactsCore(engine, {
-      sourceId: 'default',
-      slug,
-      types: ['meeting'],
-      sleepMs: 0,
-    });
-    expect(result.pages_skipped_completed).toBe(0);
-    expect(result.pages_processed).toBe(1);
-    expect(result.facts_inserted).toBeGreaterThan(0);
-  });
-
-  test('replaces long-form CLI facts when a structured meeting page changes', async () => {
-    const slug = 'meetings/structured-refresh';
-    const write = (suffix: string) => engine.putPage(slug, {
-      type: 'meeting',
-      title: 'Structured meeting refresh',
-      compiled_truth: `## Summary\n${'A decision grounded in data. '.repeat(20)} ${suffix}`,
-      timeline: '',
-      frontmatter: { date: '2026-07-19' },
-    });
-    await write('first');
-    await runExtractConversationFactsCore(engine, { sourceId: 'default', slug, types: ['meeting'], sleepMs: 0 });
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    await write('second');
-    await runExtractConversationFactsCore(engine, { sourceId: 'default', slug, types: ['meeting'], sleepMs: 0 });
-    const rows = await engine.executeRaw<{ count: string | number }>(
-      'SELECT COUNT(*) AS count FROM facts WHERE source = $1 AND source_markdown_slug = $2',
-      [PER_SEGMENT_SOURCE_PREFIX, slug],
-    );
-    expect(Number(rows[0]?.count ?? 0)).toBe(1);
-  });
-
-  test('does not durably classify a regex miss when LLM fallback is disabled', async () => {
+  test('does not classify an unrecognized parser miss as non-extractable', async () => {
     await engine.putPage('meetings/unrecognized-format', {
       type: 'meeting',
       title: 'Unrecognized meeting format',
@@ -682,171 +1042,381 @@ describe('runExtractConversationFactsCore', () => {
     });
     expect(result.pages_marked_non_extractable).toBe(0);
     const markers = await engine.executeRaw<{ count: string | number }>(
-      'SELECT COUNT(*) AS count FROM facts WHERE source = $1 AND source_markdown_slug = $2',
+      `SELECT COUNT(*) AS count FROM facts WHERE source = $1 AND source_markdown_slug = $2`,
       [NON_EXTRACTABLE_AUDIT_SOURCE, 'meetings/unrecognized-format'],
     );
     expect(Number(markers[0]?.count ?? 0)).toBe(0);
   });
 
-  test('default bulk types are meeting and slack only', () => {
-    expect(DEFAULT_TYPES).toEqual(['meeting', 'slack']);
-  });
+  test('same-timestamp text edits replay instead of trusting a stale checkpoint', async () => {
+    await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/imessage/alice-example',
+      sleepMs: 0,
+    });
+    await engine.putPage('conversations/imessage/alice-example', {
+      type: 'conversation',
+      title: 'iMessage: Alice Example',
+      compiled_truth: SAMPLE_BODY.replace(
+        'Staff engineer on the platform team.',
+        'Principal engineer on the infrastructure team.',
+      ),
+      timeline: '',
+      frontmatter: {},
+    });
 
-  test('B1: a swallowed insertFacts failure does NOT advance the cursor (page re-extracts next run)', async () => {
-    // Regression for cursor-only-on-confirmed-write. The per-segment insert
-    // is best-effort (the catch swallows + continues); pre-B1 the cursor
-    // still advanced past the unwritten facts and the terminal row was
-    // written, so the page was marked complete and never retried. This
-    // forces the INSERT-failure path (NOT abort — abort was already safe).
-    type IF = PGLiteEngine['insertFacts'];
-    const realInsertFacts: IF = engine.insertFacts.bind(engine);
-    let failing = true;
-    engine.insertFacts = (async (rows, opts) => {
-      if (failing) throw new Error('synthetic insertFacts failure');
-      return realInsertFacts(rows, opts);
-    }) as IF;
-
-    let firstThrew = false;
-    let first: Awaited<ReturnType<typeof runExtractConversationFactsCore>> | null = null;
-    try {
-      first = await runExtractConversationFactsCore(engine, {
-        sourceId: 'default',
-        slug: 'conversations/imessage/alice-example',
-        sleepMs: 0,
-      });
-    } catch {
-      firstThrew = true;
-    } finally {
-      failing = false;
-      engine.insertFacts = realInsertFacts;
-    }
-
-    // Best-effort: the call resolves (does not throw) but writes nothing.
-    expect(firstThrew).toBe(false);
-    expect(first?.facts_inserted ?? -1).toBe(0);
-
-    // No terminal audit row — the page was NOT marked complete.
-    const terminalAfterFail = await engine.executeRaw<{ count: string | number }>(
-      `SELECT COUNT(*) AS count FROM facts WHERE source = $1 AND source_session = $2`,
-      [TERMINAL_AUDIT_SOURCE, `${TERMINAL_AUDIT_SOURCE}:conversations/imessage/alice-example`],
-    );
-    expect(Number(terminalAfterFail[0]?.count ?? 0)).toBe(0);
-
-    // Second run WITHOUT --force must RE-PROCESS (the cursor never advanced).
-    // Pre-B1 this skipped (cursor had advanced past every segment).
     const second = await runExtractConversationFactsCore(engine, {
       sourceId: 'default',
       slug: 'conversations/imessage/alice-example',
       sleepMs: 0,
     });
-    expect(second.pages_processed).toBe(1);
-    expect(second.facts_inserted).toBeGreaterThan(0);
+    expect(second.pages_skipped_completed).toBe(0);
+    expect(second.segments_processed).toBe(2);
   });
 
-  test('an appended tail removes the old terminal before a failed retry', async () => {
-    await runExtractConversationFactsCore(engine, {
-      sourceId: 'default', slug: 'conversations/imessage/alice-example', sleepMs: 0,
+  test('an edit during extraction cannot mint a terminal for the old snapshot', async () => {
+    chatHook = async () => {
+      await engine.putPage('conversations/imessage/alice-example', {
+        type: 'conversation',
+        title: 'iMessage: Alice Example',
+        compiled_truth: SAMPLE_BODY.replace('Nice.', 'Updated while extraction ran.'),
+        timeline: '',
+        frontmatter: {},
+      });
+    };
+    const first = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/imessage/alice-example',
+      sleepMs: 0,
     });
+    expect(first.pages_processed).toBe(1);
+    const terminals = await engine.executeRaw<{ count: string | number }>(
+      `SELECT COUNT(*) AS count FROM facts WHERE source = $1`,
+      [TERMINAL_AUDIT_SOURCE],
+    );
+    expect(Number(terminals[0]?.count ?? 0)).toBe(0);
+
+    const retry = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/imessage/alice-example',
+      sleepMs: 0,
+    });
+    expect(retry.pages_skipped_completed).toBe(0);
+    expect(retry.pages_processed).toBe(1);
+  });
+
+  test('raw transcript sidecar edits invalidate the durable outcome', async () => {
+    await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'meetings/raw-speaker-example',
+      types: ['meeting'],
+      sleepMs: 0,
+    });
+    writeFileSync(
+      join(repoDir, 'meetings/raw-speaker-example.raw/transcript.txt'),
+      [
+        'Speaker A: The sidecar changed after the first extraction.',
+        'Speaker B: Then the snapshot hash must force a replay.',
+      ].join('\n'),
+      'utf8',
+    );
+    const second = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'meetings/raw-speaker-example',
+      types: ['meeting'],
+      sleepMs: 0,
+    });
+    expect(second.pages_skipped_completed).toBe(0);
+    expect(second.pages_processed).toBe(1);
+  });
+
+  test('provider failure leaves no terminal and retries on the next run', async () => {
+    chatFailure = new Error('synthetic provider outage');
+    await expect(
+      runExtractConversationFactsCore(engine, {
+        sourceId: 'default',
+        slug: 'conversations/imessage/alice-example',
+        sleepMs: 0,
+      }),
+    ).rejects.toThrow('provider_error');
+    const terminals = await engine.executeRaw<{ count: string | number }>(
+      `SELECT COUNT(*) AS count FROM facts WHERE source = $1`,
+      [TERMINAL_AUDIT_SOURCE],
+    );
+    expect(Number(terminals[0]?.count ?? 0)).toBe(0);
+
+    chatFailure = null;
+    const retry = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/imessage/alice-example',
+      sleepMs: 0,
+    });
+    expect(retry.pages_processed).toBe(1);
+  });
+
+  test('non-terminal model stop leaves no terminal outcome', async () => {
+    chatStopReason = 'other';
+    await expect(
+      runExtractConversationFactsCore(engine, {
+        sourceId: 'default',
+        slug: 'conversations/imessage/alice-example',
+        sleepMs: 0,
+      }),
+    ).rejects.toThrow('non_terminal_stop');
+    const terminals = await engine.executeRaw<{ count: string | number }>(
+      `SELECT COUNT(*) AS count FROM facts WHERE source = $1`,
+      [TERMINAL_AUDIT_SOURCE],
+    );
+    expect(Number(terminals[0]?.count ?? 0)).toBe(0);
+  });
+
+  test('schema-invalid model facts leave no terminal outcome', async () => {
+    chatTextOverride = JSON.stringify({ facts: [{ fact: 123, kind: 'fact' }] });
+    await expect(
+      runExtractConversationFactsCore(engine, {
+        sourceId: 'default',
+        slug: 'conversations/imessage/alice-example',
+        sleepMs: 0,
+      }),
+    ).rejects.toThrow('malformed_output');
+    const terminals = await engine.executeRaw<{ count: string | number }>(
+      `SELECT COUNT(*) AS count FROM facts WHERE source = $1`,
+      [TERMINAL_AUDIT_SOURCE],
+    );
+    expect(Number(terminals[0]?.count ?? 0)).toBe(0);
+  });
+
+  test('insert failure leaves no terminal and retries from a clean replay', async () => {
+    const engineAny = engine as any;
+    const originalInsertFacts = engineAny.insertFacts.bind(engine);
+    engineAny.insertFacts = async (facts: Array<{ source?: string }>, opts: unknown) => {
+      if (facts.some((fact) => fact.source === PER_SEGMENT_SOURCE_PREFIX)) {
+        throw new Error('synthetic insert outage');
+      }
+      return originalInsertFacts(facts, opts);
+    };
+    try {
+      await expect(
+        runExtractConversationFactsCore(engine, {
+          sourceId: 'default',
+          slug: 'conversations/imessage/alice-example',
+          sleepMs: 0,
+        }),
+      ).rejects.toThrow('synthetic insert outage');
+    } finally {
+      engineAny.insertFacts = originalInsertFacts;
+    }
+    const terminals = await engine.executeRaw<{ count: string | number }>(
+      `SELECT COUNT(*) AS count FROM facts WHERE source = $1`,
+      [TERMINAL_AUDIT_SOURCE],
+    );
+    expect(Number(terminals[0]?.count ?? 0)).toBe(0);
+    const retry = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/imessage/alice-example',
+      sleepMs: 0,
+    });
+    expect(retry.pages_processed).toBe(1);
+  });
+
+  test('terminal insert failure is reported as unfinished in bulk mode', async () => {
+    const engineAny = engine as any;
+    const originalInsertFacts = engineAny.insertFacts.bind(engine);
+    engineAny.insertFacts = async (facts: Array<{ source?: string }>, opts: unknown) => {
+      if (facts.some((fact) => fact.source === TERMINAL_AUDIT_SOURCE)) {
+        throw new Error('synthetic terminal insert outage');
+      }
+      return originalInsertFacts(facts, opts);
+    };
+    try {
+      const result = await runExtractConversationFactsCore(engine, {
+        sourceId: 'default',
+        types: ['conversation'],
+        sleepMs: 0,
+      });
+      expect(result.pages_failed).toBe(1);
+      expect(result.pages_processed).toBe(0);
+    } finally {
+      engineAny.insertFacts = originalInsertFacts;
+    }
+    const terminals = await engine.executeRaw<{ count: string | number }>(
+      `SELECT COUNT(*) AS count FROM facts WHERE source = $1`,
+      [TERMINAL_AUDIT_SOURCE],
+    );
+    expect(Number(terminals[0]?.count ?? 0)).toBe(0);
+  });
+
+  test('cleanup failure cannot mint a non-extractable marker', async () => {
+    await engine.putPage('conversations/cleanup-failure', {
+      type: 'slack',
+      title: 'Cleanup failure',
+      compiled_truth: fmt('Alice Example', '2024-03-15', '9:00 AM', 'one message'),
+      timeline: '',
+      frontmatter: {},
+    });
+    const engineAny = engine as any;
+    const originalExecuteRaw = engineAny.executeRaw.bind(engine);
+    engineAny.executeRaw = async (sql: string, params?: unknown[]) => {
+      if (sql.includes('WITH del AS')) throw new Error('synthetic cleanup outage');
+      return originalExecuteRaw(sql, params);
+    };
+    try {
+      await expect(
+        runExtractConversationFactsCore(engine, {
+          sourceId: 'default',
+          slug: 'conversations/cleanup-failure',
+          types: ['slack'],
+          sleepMs: 0,
+        }),
+      ).rejects.toThrow('synthetic cleanup outage');
+    } finally {
+      engineAny.executeRaw = originalExecuteRaw;
+    }
+    const markers = await engine.executeRaw<{ count: string | number }>(
+      `SELECT COUNT(*) AS count FROM facts WHERE source = $1`,
+      [NON_EXTRACTABLE_AUDIT_SOURCE],
+    );
+    expect(Number(markers[0]?.count ?? 0)).toBe(0);
+  });
+
+  test('--limit counts pending work after completed pages are filtered', async () => {
+    for (const slug of ['conversations/a-complete', 'conversations/b-pending']) {
+      await engine.putPage(slug, {
+        type: 'slack',
+        title: slug,
+        compiled_truth: SAMPLE_BODY,
+        timeline: '',
+        frontmatter: {},
+      });
+    }
+    await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/a-complete',
+      types: ['slack'],
+      sleepMs: 0,
+    });
+    const bulk = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      types: ['slack'],
+      limit: 1,
+      sleepMs: 0,
+    });
+    expect(bulk.pages_skipped_completed).toBe(1);
+    expect(bulk.pages_processed).toBe(1);
+    const pendingTerminal = await engine.executeRaw<{ count: string | number }>(
+      `SELECT COUNT(*) AS count FROM facts
+        WHERE source = $1 AND source_markdown_slug = $2`,
+      [TERMINAL_AUDIT_SOURCE, 'conversations/b-pending'],
+    );
+    expect(Number(pendingTerminal[0]?.count ?? 0)).toBe(1);
+  });
+
+  test('bulk mode reports provider failures instead of returning a clean result', async () => {
+    chatFailure = new Error('synthetic bulk provider outage');
+    const result = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      types: ['conversation'],
+      sleepMs: 0,
+    });
+    expect(result.pages_failed).toBe(1);
+    expect(result.pages_processed).toBe(0);
+  });
+
+  test('content identity reopens a page even when updated_at is unchanged', async () => {
+    await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/imessage/alice-example',
+      sleepMs: 0,
+    });
+    const original = await engine.executeRaw<{ updated_at: Date }>(
+      `SELECT updated_at FROM pages
+        WHERE source_id = 'default' AND slug = 'conversations/imessage/alice-example'`,
+    );
     await engine.putPage('conversations/imessage/alice-example', {
       type: 'conversation',
       title: 'iMessage: Alice Example',
-      compiled_truth: SAMPLE_BODY + '\n' + [
-        fmt('Alice Example', '2024-03-17', '9:00 AM', 'A new update arrived.'),
-        fmt('Bob Demo', '2024-03-17', '9:05 AM', 'Acknowledged.'),
+      compiled_truth: SAMPLE_BODY.replace('Nice.', 'Changed at the same timestamp.'),
+      timeline: '',
+      frontmatter: {},
+    });
+    await engine.executeRaw(
+      `UPDATE pages SET updated_at = $1
+        WHERE source_id = 'default' AND slug = 'conversations/imessage/alice-example'`,
+      [original[0]!.updated_at],
+    );
+    const result = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/imessage/alice-example',
+      sleepMs: 0,
+    });
+    expect(result.pages_skipped_completed).toBe(0);
+    expect(result.pages_processed).toBe(1);
+  });
+
+  test('effective_date survives locked refetch and invalidates completion', async () => {
+    await engine.putPage('meetings/effective-date', {
+      type: 'meeting',
+      title: 'Effective date meeting',
+      compiled_truth: [
+        'Speaker A: We approved the proposal.',
+        'Speaker B: I will publish it tomorrow.',
       ].join('\n'),
       timeline: '',
       frontmatter: {},
     });
-
-    type IF = PGLiteEngine['insertFacts'];
-    const realInsertFacts: IF = engine.insertFacts.bind(engine);
-    engine.insertFacts = (async () => { throw new Error('synthetic appended-tail failure'); }) as IF;
-    try {
-      await runExtractConversationFactsCore(engine, {
-        sourceId: 'default', slug: 'conversations/imessage/alice-example', sleepMs: 0,
-      });
-    } finally {
-      engine.insertFacts = realInsertFacts;
-    }
-
-    const terminal = await engine.executeRaw<{ count: string | number }>(
-      `SELECT COUNT(*) AS count FROM facts WHERE source = $1 AND source_markdown_slug = $2`,
-      [TERMINAL_AUDIT_SOURCE, 'conversations/imessage/alice-example'],
+    await engine.executeRaw(
+      `UPDATE pages SET effective_date = '2026-01-01T00:00:00Z'
+        WHERE source_id = 'default' AND slug = 'meetings/effective-date'`,
     );
-    expect(Number(terminal[0]?.count ?? 0)).toBe(0);
-  });
-
-  test('deadline aborts an in-flight segment and preserves it for retry', async () => {
-    __setChatTransportForTests(async (opts): Promise<ChatResult> => new Promise((_, reject) => {
-      opts.abortSignal?.addEventListener('abort', () => {
-        const error = new Error('deadline');
-        error.name = 'AbortError';
-        reject(error);
-      }, { once: true });
-    }));
-    try {
-      const result = await runExtractConversationFactsCore(engine, {
-        sourceId: 'default',
-        slug: 'conversations/imessage/alice-example',
-        sleepMs: 0,
-        deadlineMs: 25,
-      });
-      expect(result.deadline_hit).toBe(true);
-      expect(result.segments_processed).toBe(0);
-    } finally {
-      let restoredCallIndex = 0;
-      __setChatTransportForTests(async (): Promise<ChatResult> => ({
-        text: JSON.stringify({ facts: [{
-          fact: `synthetic restored fact #${++restoredCallIndex}`,
-          kind: 'event', entity: 'companies/acme-corp',
-          confidence: 1.0, notability: 'high',
-        }] }), blocks: [], stopReason: 'end',
-        usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
-        model: 'stub:stub', providerId: 'stub',
-      }));
-    }
-  });
-
-  test('deadline also bounds the LLM conversation-parser fallback', async () => {
-    await engine.putPage('conversations/llm-fallback-deadline', {
-      type: 'conversation',
-      title: 'Imported conversation',
-      compiled_truth: 'A narrative transcript with no recognized speaker timestamp syntax.',
-      timeline: '',
-      frontmatter: {},
+    const first = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'meetings/effective-date',
+      types: ['meeting'],
+      sleepMs: 0,
     });
-    await engine.setConfig('conversation_parser.llm_fallback_enabled', 'true');
-    __setChatTransportForTests(async (opts): Promise<ChatResult> => new Promise((_, reject) => {
-      opts.abortSignal?.addEventListener('abort', () => {
-        const error = new Error('deadline');
-        error.name = 'AbortError';
-        reject(error);
-      }, { once: true });
-    }));
-    try {
-      await withEnv({ ANTHROPIC_API_KEY: 'sk-test' }, async () => {
-        const result = await runExtractConversationFactsCore(engine, {
-          sourceId: 'default',
-          slug: 'conversations/llm-fallback-deadline',
-          sleepMs: 0,
-          deadlineMs: 25,
-        });
-        expect(result.deadline_hit).toBe(true);
-        expect(result.segments_processed).toBe(0);
-      });
-    } finally {
-      await engine.executeRaw(`DELETE FROM config WHERE key = 'conversation_parser.llm_fallback_enabled'`);
-      let restoredCallIndex = 0;
-      __setChatTransportForTests(async (): Promise<ChatResult> => ({
-        text: JSON.stringify({ facts: [{
-          fact: `synthetic fallback-restored fact #${++restoredCallIndex}`,
-          kind: 'event', entity: 'companies/acme-corp',
-          confidence: 1.0, notability: 'high',
-        }] }), blocks: [], stopReason: 'end',
-        usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
-        model: 'stub:stub', providerId: 'stub',
-      }));
-    }
+    expect(first.pages_processed).toBe(1);
+    const firstTerminal = await engine.executeRaw<{ source_session: string }>(
+      `SELECT source_session FROM facts
+        WHERE source = $1 AND source_markdown_slug = 'meetings/effective-date'`,
+      [TERMINAL_AUDIT_SOURCE],
+    );
+    expect(firstTerminal[0]!.source_session.endsWith('-2026-01-01')).toBe(true);
+
+    await engine.executeRaw(
+      `UPDATE pages SET effective_date = '2026-01-02T00:00:00Z'
+        WHERE source_id = 'default' AND slug = 'meetings/effective-date'`,
+    );
+    const second = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'meetings/effective-date',
+      types: ['meeting'],
+      sleepMs: 0,
+    });
+    expect(second.pages_skipped_completed).toBe(0);
+    expect(second.pages_processed).toBe(1);
+  });
+
+  test('legacy terminal rows do not suppress strict v2 replay', async () => {
+    await engine.executeRaw(
+      `INSERT INTO facts (
+         fact, kind, source, source_session, confidence, notability,
+         row_num, source_markdown_slug, source_id
+       ) VALUES (
+         'EXTRACTION_COMPLETE', 'fact', $1, $2, 1.0, 'low', 0, $3, 'default'
+       )`,
+      [
+        'cli:extract-conversation-facts:terminal',
+        'cli:extract-conversation-facts:terminal:conversations/imessage/alice-example',
+        'conversations/imessage/alice-example',
+      ],
+    );
+    const result = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/imessage/alice-example',
+      sleepMs: 0,
+    });
+    expect(result.pages_skipped_completed).toBe(0);
+    expect(result.pages_processed).toBe(1);
   });
 
   test('row_num accumulator: segment 2 facts start after segment 1 (Codex C1)', async () => {
@@ -870,81 +1440,6 @@ describe('runExtractConversationFactsCore', () => {
     }
   });
 
-  test('intra-page resume: a partial run resumes mid-page without re-extracting the committed prefix', async () => {
-    // Force a partial run: segmentLimit=1 processes only segment 1 (Mar 15),
-    // leaves segment 2 (Mar 16) for next time, and writes NO terminal row.
-    const first = await runExtractConversationFactsCore(engine, {
-      sourceId: 'default',
-      slug: 'conversations/imessage/alice-example',
-      sleepMs: 0,
-      segmentLimit: 1,
-    });
-    expect(first.segments_processed).toBe(1);
-    expect(first.facts_inserted).toBe(1);
-
-    const seg1 = `${PER_SEGMENT_SOURCE_PREFIX}:conversations/imessage/alice-example`;
-    const factsAfter1 = await engine.executeRaw<{ count: string | number }>(
-      `SELECT COUNT(*) AS count FROM facts WHERE source = $1 AND source_session = $2`,
-      [PER_SEGMENT_SOURCE_PREFIX, seg1],
-    );
-    expect(Number(factsAfter1[0]?.count ?? 0)).toBe(1);
-    // No terminal row — the page is NOT complete.
-    const term1 = await engine.executeRaw<{ count: string | number }>(
-      `SELECT COUNT(*) AS count FROM facts WHERE source = $1 AND source_session = $2`,
-      [TERMINAL_AUDIT_SOURCE, `${TERMINAL_AUDIT_SOURCE}:conversations/imessage/alice-example`],
-    );
-    expect(Number(term1[0]?.count ?? 0)).toBe(0);
-
-    // Second run, NO segmentLimit: must RESUME from segment 2 — NOT wipe and
-    // re-extract segment 1. The committed prefix is preserved (no orphan
-    // cleanup), row_num stays contiguous, and the page completes.
-    const second = await runExtractConversationFactsCore(engine, {
-      sourceId: 'default',
-      slug: 'conversations/imessage/alice-example',
-      sleepMs: 0,
-    });
-    expect(second.orphan_facts_cleaned).toBe(0); // committed prefix preserved
-    expect(second.segments_processed).toBe(1);   // only segment 2 re-done
-    expect(second.facts_inserted).toBe(1);
-
-    // Total per-segment facts = 2 (segment 1 preserved + segment 2 new).
-    const factsAfter2 = await engine.executeRaw<{ count: string | number }>(
-      `SELECT COUNT(*) AS count FROM facts WHERE source = $1 AND source_session = $2`,
-      [PER_SEGMENT_SOURCE_PREFIX, seg1],
-    );
-    expect(Number(factsAfter2[0]?.count ?? 0)).toBe(2);
-    // row_num contiguous across the two runs (0,1) — continuity preserved.
-    const rows = await engine.executeRaw<{ row_num: number }>(
-      `SELECT row_num FROM facts WHERE source = $1 AND source_markdown_slug = $2 ORDER BY row_num ASC`,
-      [PER_SEGMENT_SOURCE_PREFIX, 'conversations/imessage/alice-example'],
-    );
-    expect(rows.map((r) => Number(r.row_num))).toEqual([0, 1]);
-    // Page now complete — terminal row present.
-    const term2 = await engine.executeRaw<{ count: string | number }>(
-      `SELECT COUNT(*) AS count FROM facts WHERE source = $1 AND source_session = $2`,
-      [TERMINAL_AUDIT_SOURCE, `${TERMINAL_AUDIT_SOURCE}:conversations/imessage/alice-example`],
-    );
-    expect(Number(term2[0]?.count ?? 0)).toBe(1);
-  });
-
-  test('segmentLimit equal to the segment count still completes (writes terminal row, no livelock)', async () => {
-    // SAMPLE_BODY has exactly 2 segments. segmentLimit=2 processes both; the
-    // page MUST get its terminal row (else it sits in the backlog forever:
-    // next run sees 0 segments and returns before any terminal write).
-    const result = await runExtractConversationFactsCore(engine, {
-      sourceId: 'default',
-      slug: 'conversations/imessage/alice-example',
-      sleepMs: 0,
-      segmentLimit: 2,
-    });
-    expect(result.segments_processed).toBe(2);
-    const term = await engine.executeRaw<{ count: string | number }>(
-      `SELECT COUNT(*) AS count FROM facts WHERE source = $1 AND source_session = $2`,
-      [TERMINAL_AUDIT_SOURCE, `${TERMINAL_AUDIT_SOURCE}:conversations/imessage/alice-example`],
-    );
-    expect(Number(term[0]?.count ?? 0)).toBe(1);
-  });
-
   test('--force clears resume entry, allowing re-run', async () => {
     const first = await runExtractConversationFactsCore(engine, {
       sourceId: 'default',
@@ -952,7 +1447,7 @@ describe('runExtractConversationFactsCore', () => {
       sleepMs: 0,
     });
     expect(first.pages_processed).toBe(1);
-    // Re-run without force: durable terminal selection skips the page.
+    // Re-run without force: no new segments (sinceIso > newest segment endIso).
     const second = await runExtractConversationFactsCore(engine, {
       sourceId: 'default',
       slug: 'conversations/imessage/alice-example',
@@ -1001,5 +1496,144 @@ describe('runExtractConversationFactsCore', () => {
 describe('body cap constant (Eng A2)', () => {
   test('MAX_PAGE_BODY_BYTES is 25MB', () => {
     expect(MAX_PAGE_BODY_BYTES).toBe(25 * 1024 * 1024);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #4136 — folded speaker headings: decline gate, counter, non-terminal skip.
+// Self-contained engine + transport (the main describe resets both in its
+// afterAll, so this block installs its own).
+// ---------------------------------------------------------------------------
+
+describe('#4136 folded speaker headings — decline gate is non-terminal', () => {
+  let engine: PGLiteEngine;
+
+  const FOLDED_BODY = [
+    '## User', '', 'What is the deploy command?', '',
+    '## Claude', '', 'Run the deploy script from the repo root.', '',
+    '## User', '', 'Thanks.',
+  ].join('\n');
+
+  const NOTES_BODY = [
+    '## User', '', 'Journal entry one.', '',
+    '## Notes', '', 'unfenced doc heading inside my own page', '',
+    '## User', '', 'Journal entry two.',
+  ].join('\n');
+
+  beforeAll(async () => {
+    engine = new PGLiteEngine();
+    await engine.connect({});
+    await engine.initSchema();
+    await engine.setConfig('facts.extraction_enabled', 'true');
+    await engine.setConfig('conversation_parser.llm_fallback_enabled', 'false');
+    __setChatTransportForTests(async (): Promise<ChatResult> => ({
+      text: '{"facts":[]}',
+      blocks: [{ type: 'text', text: '{"facts":[]}' }],
+      stopReason: 'end',
+      usage: { input_tokens: 5, output_tokens: 2, cache_read_tokens: 0, cache_creation_tokens: 0 },
+      model: 'anthropic:claude-haiku-4-5-20251001',
+      providerId: 'anthropic',
+    }));
+    await engine.putPage('conversations/folded-claude-example', {
+      type: 'conversation',
+      title: 'Folded transcript',
+      compiled_truth: FOLDED_BODY,
+      timeline: '',
+      frontmatter: { date: '2026-06-02' },
+    });
+    await engine.putPage('conversations/notes-journal-example', {
+      type: 'conversation',
+      title: 'Single-speaker journal with a Notes heading',
+      compiled_truth: NOTES_BODY,
+      timeline: '',
+      frontmatter: { date: '2026-06-02' },
+    });
+  });
+
+  afterAll(async () => {
+    __setChatTransportForTests(null);
+    resetGateway();
+    await engine.disconnect();
+  });
+
+  test('a folded speaker-shaped heading with degenerate speakers DECLINES: counter bumped, zero facts, NO durable audit row', async () => {
+    const result = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/folded-claude-example',
+      sleepMs: 0,
+    });
+    expect(result.pages_skipped_unrecognized_speaker).toBe(1);
+    expect(result.facts_inserted).toBe(0);
+    // The single highest-risk line (#4136): a decline must NOT write the
+    // EXTRACTION_NOT_APPLICABLE row — that row is versionToken-keyed and
+    // would skip the page forever, even after the parser learns the label.
+    expect(result.pages_marked_non_extractable).toBe(0);
+    const markers = await engine.executeRaw<{ count: string | number }>(
+      `SELECT COUNT(*) AS count FROM facts WHERE source = $1 AND source_session LIKE $2`,
+      [NON_EXTRACTABLE_AUDIT_SOURCE, `${NON_EXTRACTABLE_AUDIT_SOURCE}:conversations/folded-claude-example:%`],
+    );
+    expect(Number(markers[0]?.count ?? 0)).toBe(0);
+  });
+
+  test('RETRYABLE: a second run re-considers the declined page instead of short-circuiting at the outcome gate', async () => {
+    const second = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/folded-claude-example',
+      sleepMs: 0,
+    });
+    expect(second.pages_considered).toBe(1);
+    expect(second.pages_skipped_completed).toBe(0);
+    expect(second.pages_skipped_non_extractable).toBe(0);
+    expect(second.pages_skipped_unrecognized_speaker).toBe(1); // declined again — visibly, not silently
+  });
+
+  test('WARN-ONLY branch: a speaker-shaped fold BETWEEN alternating speakers proceeds with the stderr warn (residual risk, visible)', async () => {
+    await engine.putPage('conversations/folded-multispeaker-example', {
+      type: 'conversation',
+      title: 'Folded heading between alternating speakers',
+      compiled_truth: [
+        '## User', '', 'Question one?', '',
+        '## Assistant', '', 'Answer one.', '',
+        '## Claude', '', 'A folded reply.', '',
+        '## User', '', 'Question two?', '',
+        '## Assistant', '', 'Answer two.',
+      ].join('\n'),
+      timeline: '',
+      frontmatter: { date: '2026-06-02' },
+    });
+    const warns: string[] = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    (process.stderr as unknown as { write: (c: string) => boolean }).write = (c: string) => {
+      warns.push(String(c));
+      return origWrite(c);
+    };
+    try {
+      const result = await runExtractConversationFactsCore(engine, {
+        sourceId: 'default',
+        slug: 'conversations/folded-multispeaker-example',
+        sleepMs: 0,
+      });
+      // Speakers alternate (User + Assistant = 2 distinct) → NOT declined,
+      // extraction proceeds, and the warn names the folded label.
+      expect(result.pages_skipped_unrecognized_speaker).toBe(0);
+      expect(result.pages_processed).toBe(1);
+      expect(warns.some((w) => w.includes('folded unrecognized heading(s) [Claude]') && w.includes('proceeding'))).toBe(true);
+    } finally {
+      (process.stderr as unknown as { write: unknown }).write = origWrite;
+    }
+  });
+
+  test('NO REGRESSION: a single-speaker page with an unfenced doc heading (## Notes) is warn-only and still extracts', async () => {
+    const result = await runExtractConversationFactsCore(engine, {
+      sourceId: 'default',
+      slug: 'conversations/notes-journal-example',
+      sleepMs: 0,
+    });
+    // 'Notes' is stoplisted → not speaker-shaped → no decline, extraction
+    // proceeds through the normal pipeline (eng F3: the bare
+    // "non-empty + degenerate speakers" rule would have false-declined this).
+    expect(result.pages_skipped_unrecognized_speaker).toBe(0);
+    expect(result.pages_processed).toBe(1);
+    expect(result.segments_processed).toBeGreaterThanOrEqual(1);
   });
 });
