@@ -386,9 +386,7 @@ export async function dispatchPerSource(
 
   let sources: SourceRow[];
   try {
-    // Include database-only sources. Filesystem phases bind to each source's
-    // own local_path and skip cleanly when it is absent.
-    sources = await engine.listAllSources();
+    sources = await engine.listAllSources({ localPathOnly: true });
   } catch (e) {
     // Brand-new brain without sources table (pre-v0.18) — fall through
     // to the legacy single-job path. The error path here also covers
