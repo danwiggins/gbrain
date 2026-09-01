@@ -2,6 +2,17 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.47.9.1] - 2026-09-01
+
+### Changed
+- Fork catch-up merge: upstream v0.47.9.0 merged into the fork (720 commits,
+  0.42.58 -> 0.47.9). Fork-kept features: the `realtime_absorb_recovery`
+  cycle phase, checkoutless Postgres autopilot, budget-exhaustion
+  propagation in facts extraction, and the meeting+slack backfill default.
+  Superseded fork implementations (bulk-extraction durability, LLM parse
+  fallback, the Slack bold-time-dash pattern, orphan-type env exclusion)
+  yield to their upstream equivalents.
+
 ## [0.47.9.0] - 2026-08-31
 
 Optional Memorable integration, adopted from community PR #4537 (thank you
