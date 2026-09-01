@@ -36,7 +36,7 @@
  *   cycle.conversation_facts_backfill.max_total_cost_usd   (5.00)
  *   cycle.conversation_facts_backfill.max_walltime_min     (20)
  *   cycle.conversation_facts_backfill.max_total_walltime_min (30)
- *   cycle.conversation_facts_backfill.types                ([meeting, slack] — DEFAULT_TYPES; email stays explicit)
+ *   cycle.conversation_facts_backfill.types                (all of ALLOWED_TYPES — src/core/facts/conversation-types.ts)
  *
  * `.types` is the single source of truth for "enabled types" — the CLI
  * default reads from the same key (Eng-v2 A2).
@@ -59,10 +59,6 @@ import {
 // binding extract-conversation-facts.ts re-exports) so this phase is part of
 // the drift-guarded set in test/conversation-facts-type-allowlist-drift.test.ts.
 import { ALLOWED_TYPES, type AllowedType } from '../facts/conversation-types.ts';
-
-// Cost-control default for the cycle phase: meeting + Slack only; email and
-// the other ALLOWED_TYPES stay explicit opt-ins via the `.types` config key.
-const DEFAULT_TYPES: readonly AllowedType[] = ['meeting', 'slack'];
 
 /** Per-phase wrapper opts. */
 export interface ConversationFactsBackfillPhaseOpts {
@@ -131,7 +127,7 @@ async function loadCfg(engine: BrainEngine): Promise<ResolvedConfig> {
     return Number.isFinite(n) && n > 0 ? n : fallback;
   };
 
-  let types: AllowedType[] = [...DEFAULT_TYPES];
+  let types: AllowedType[] = [...ALLOWED_TYPES];
   if (typesRaw) {
     try {
       const parsed = JSON.parse(typesRaw);
