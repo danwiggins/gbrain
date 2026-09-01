@@ -28,3 +28,7 @@
 # removes the whole class for anyone working here.
 *.md text eol=lf
 /.gbrain-evals/eval-results.jsonl merge=union
+
+# JSONL fixtures are hashed byte-for-byte into skills/skills.lock.json;
+# a CRLF checkout regenerates different hashes than CI. Same class as *.sh/*.md.
+*.jsonl text eol=lf
