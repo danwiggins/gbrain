@@ -224,7 +224,10 @@ describe('buildChecks — orchestrator against PGLite', () => {
     const after = (await buildChecks(engine, []))
       .find(c => c.name === 'facts_extraction_health');
     expect(after?.status).toBe('ok');
-    expect(after?.message).toContain('No unresolved facts extraction failures');
+    // The exact ok-message depends on whether an extraction model is
+    // servable in this environment (keyless installs get the guidance
+    // copy). The tombstone pin is that the failure detail is GONE.
+    expect(after?.message).not.toContain('pipeline_error');
   });
 
   test('returns partial check list when engine is null (no early process.exit)', async () => {

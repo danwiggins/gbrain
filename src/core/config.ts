@@ -1462,7 +1462,6 @@ export const KNOWN_CONFIG_KEY_PREFIXES: readonly string[] = [
   'autopilot.',         // autopilot.nightly_quality_probe.*, autopilot.auto_drain.* (#1685)
   'chronicle.',         // chronicle.tz + future Life Chronicle knobs (#2390)
   'self_upgrade.',      // v0.42 self-upgrade (mode, quiet_hours, state)
-  'conversation_parser.', // conversation_parser.llm_fallback_enabled (LLM parse-fallback opt-in)
   // Queue admission control (per-name sub-keys):
   //   minions.coalesce_params.<name>, minions.ttl_waiting_hours.<name>,
   //   minions.quota_max_waiting.<name>, plus the one-time
