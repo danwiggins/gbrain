@@ -32,3 +32,7 @@
 # JSONL fixtures are hashed byte-for-byte into skills/skills.lock.json;
 # a CRLF checkout regenerates different hashes than CI. Same class as *.sh/*.md.
 *.jsonl text eol=lf
+
+# Same rationale for the remaining text files the skills manifest hashes.
+skills/**/*.json text eol=lf
+skills/**/*.yaml text eol=lf
